@@ -328,14 +328,6 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
             // 通过 KCP 接收完整文件
             this._handleIncomingFile(msg, displayName);
             return;
-        } else if (msg.type === 'file_chunk') {
-            // 处理文件块（旧 UDP 方式，保留兼容）
-            this._handleFileChunk(msg, displayName);
-            return;
-        } else if (msg.type === 'file_progress') {
-            // 更新接收进度
-            this._updateReceiveProgress(msg);
-            return;
         }
 
         const incomingMessage: ChatMessage = {

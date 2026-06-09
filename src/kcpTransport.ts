@@ -1,4 +1,4 @@
-import { Listen, Dial, UDPSession } from 'kcpjs';
+import { Listen, Dial, UDPSession, Listener } from 'kcpjs';
 import * as events from 'events';
 
 /**
@@ -9,7 +9,7 @@ import * as events from 'events';
  * KCP 通道用于：文件传输（可靠、断点续传）
  */
 export class KcpTransport extends events.EventEmitter {
-    private _listener: any = null;
+    private _listener: Listener | null = null;
     /** key: `ip:port` -> UDPSession */
     private _sessions: Map<string, UDPSession> = new Map();
     private _port: number;
@@ -85,7 +85,7 @@ export class KcpTransport extends events.EventEmitter {
      * @returns 会话 key `ip:port`
      */
     async connect(conv: number, host: string, port: number): Promise<string> {
-        const session = Dial(conv, port, host);
+        const session = Dial(conv, port, host) as UDPSession;
         const key = `${host}:${port}`;
 
         // 如果已有会话，先关闭

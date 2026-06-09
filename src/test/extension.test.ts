@@ -271,38 +271,58 @@ suite('Extension Test Suite', () => {
             assert.strictEqual(msg.file?.size, 1024);
         });
 
-        test('should create valid file chunk message', () => {
+        test('should create valid discovery request message', () => {
             const msg: NetworkMessage = {
-                type: 'file_chunk',
+                type: 'discovery_request',
                 from: '192.168.1.100',
-                to: '192.168.1.101:8080',
+                fromHostname: 'PC-Test',
+                fromNickname: '测试用户',
                 timestamp: Date.now(),
-                file: {
-                    name: 'test.txt',
-                    size: 2048,
-                    chunkIndex: 0,
-                    totalChunks: 2,
-                    data: 'chunkdata'
-                }
+                kcpPort: 9080
             };
-            assert.strictEqual(msg.file?.chunkIndex, 0);
-            assert.strictEqual(msg.file?.totalChunks, 2);
+            assert.strictEqual(msg.type, 'discovery_request');
+            assert.strictEqual(msg.fromHostname, 'PC-Test');
+            assert.strictEqual(msg.fromNickname, '测试用户');
+            assert.strictEqual(msg.kcpPort, 9080);
         });
 
-        test('should create valid file progress message', () => {
+        test('should create valid discovery response message', () => {
             const msg: NetworkMessage = {
-                type: 'file_progress',
+                type: 'discovery_response',
+                from: '192.168.1.101',
+                fromHostname: 'PC-Remote',
+                to: '192.168.1.100:8080',
+                timestamp: Date.now(),
+                kcpPort: 9080
+            };
+            assert.strictEqual(msg.type, 'discovery_response');
+            assert.strictEqual(msg.fromHostname, 'PC-Remote');
+        });
+
+        test('should create valid heartbeat message', () => {
+            const msg: NetworkMessage = {
+                type: 'heartbeat',
                 from: '192.168.1.100',
+                fromHostname: 'PC-Test',
                 to: '192.168.1.101:8080',
                 timestamp: Date.now(),
-                progress: {
-                    transferred: 512,
-                    total: 1024,
-                    percentage: 50
-                }
+                kcpPort: 9080
             };
-            assert.strictEqual(msg.progress?.percentage, 50);
-            assert.strictEqual(msg.progress?.transferred, 512);
+            assert.strictEqual(msg.type, 'heartbeat');
+            assert.strictEqual(msg.fromHostname, 'PC-Test');
+        });
+
+        test('should create valid heartbeat_ack message', () => {
+            const msg: NetworkMessage = {
+                type: 'heartbeat_ack',
+                from: '192.168.1.101',
+                fromHostname: 'PC-Remote',
+                to: '192.168.1.100:8080',
+                timestamp: Date.now(),
+                kcpPort: 9080
+            };
+            assert.strictEqual(msg.type, 'heartbeat_ack');
+            assert.strictEqual(msg.fromHostname, 'PC-Remote');
         });
     });
 
