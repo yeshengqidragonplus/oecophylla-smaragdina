@@ -18,6 +18,15 @@ This file provides guidance to agents when working with code in this repository.
 - 大括号：必须使用（curly: warn）
 - 相等比较：使用 ===（eqeqeq: warn）
 
+## Encoding
+- **Encoding**: All text/file editing tools (especially `apply_diff`) must use UTF-8 encoding when reading and writing files to correctly handle Chinese characters and special characters in comments
+
+## Git tooling
+- Git Commit Message Info,wirte like this:AI(DS4)-提交内容分类：具体内容概括，多内容时可以一句概述然后具体事项换行，1，2，3，4，...这样列出。
+- Commit but never push.
+- 按功能颗粒度细一点提交，以后有问题直接revert整个Commit比较方便。
+- 每次提交只包含这次功能修改相关内容，不是你改的不要提交。
+
 ## 项目结构
 - `src/extension.ts` - 插件入口点
 - `src/test/` - 测试文件
