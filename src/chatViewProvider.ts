@@ -28,6 +28,20 @@ interface ChatSession {
     transferProgress?: number; // 传输进度 0-100
 }
 
+/**
+ * 接收中的文件传输
+ */
+interface IncomingFileTransfer {
+    fileName: string;
+    fileSize: number;
+    totalChunks: number;
+    receivedChunks: number;
+    chunks: Map<number, string>; // chunkIndex -> base64 data
+    peerId: string;
+    peerName: string;
+    startTime: number;
+}
+
 export class ChatViewProvider implements vscode.WebviewViewProvider {
     public static readonly viewType = 'OSChatView';
     private _view?: vscode.WebviewView;
@@ -38,6 +52,8 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     private _peersManager: PeersManager;
     private _selectedFiles: Map<string, { name: string; path: string; content: string; size: number }> = new Map();
     private _activeTransferTasks: Map<string, TransferTask> = new Map();
+    /** 接收中的文件传输 key: `${peerId}:${fileName}` */
+    private _incomingFileTransfers: Map<string, IncomingFileTransfer> = new Map();
 
     constructor(
         private readonly _extensionUri: vscode.Uri,
@@ -308,8 +324,12 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         let content = '';
         if (msg.type === 'message') {
             content = `📨 来自 ${displayName}:\n${msg.content || ''}`;
+        } else if (msg.type === 'file') {
+            // 通过 KCP 接收完整文件
+            this._handleIncomingFile(msg, displayName);
+            return;
         } else if (msg.type === 'file_chunk') {
-            // 处理文件块
+            // 处理文件块（旧 UDP 方式，保留兼容）
             this._handleFileChunk(msg, displayName);
             return;
         } else if (msg.type === 'file_progress') {
@@ -330,14 +350,239 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     }
 
     private _handleFileChunk(msg: NetworkMessage, displayName: string): void {
-        // TODO: 实现文件块接收和组装
-        console.log(`Received file chunk from ${displayName}: ${msg.file?.name} chunk ${msg.file?.chunkIndex}`);
+        if (!msg.file || msg.file.chunkIndex === undefined || msg.file.totalChunks === undefined || !msg.file.data) {
+            return;
+        }
+
+        const transferKey = `${msg.from}:${msg.file.name}`;
+        let transfer = this._incomingFileTransfers.get(transferKey);
+
+        if (!transfer) {
+            // 首次收到该文件，创建传输记录
+            transfer = {
+                fileName: msg.file.name,
+                fileSize: msg.file.size,
+                totalChunks: msg.file.totalChunks,
+                receivedChunks: 0,
+                chunks: new Map(),
+                peerId: msg.from,
+                peerName: displayName,
+                startTime: Date.now()
+            };
+            this._incomingFileTransfers.set(transferKey, transfer);
+
+            // 添加系统消息：开始接收
+            this._addSystemMessage(`📥 正在接收来自 ${displayName} 的文件: ${msg.file.name} (${this._formatFileSize(msg.file.size)})`);
+            this._updateWebviewContent();
+        }
+
+        // 如果该块已接收过，跳过
+        if (transfer.chunks.has(msg.file.chunkIndex)) {
+            return;
+        }
+
+        // 存储块数据
+        transfer.chunks.set(msg.file.chunkIndex, msg.file.data);
+        transfer.receivedChunks = transfer.chunks.size;
+
+        // 更新进度
+        const progress = Math.floor((transfer.receivedChunks / transfer.totalChunks) * 100);
+        this._updateReceiveProgressUI(transferKey, transfer, progress);
+
+        // 检查是否所有块都已接收
+        if (transfer.receivedChunks >= transfer.totalChunks) {
+            this._assembleAndSaveFile(transferKey, transfer);
+        }
+    }
+
+    /**
+     * 处理通过 KCP 可靠传输接收的完整文件
+     */
+    private _handleIncomingFile(msg: NetworkMessage, displayName: string): void {
+        if (!msg.file || !msg.file.data) {
+            return;
+        }
+
+        const transferKey = `${msg.from}:${msg.file.name}`;
+        const fileSize = msg.file.size || msg.file.data.length;
+
+        // 添加系统消息：开始接收
+        this._addSystemMessage(`📥 正在接收来自 ${displayName} 的文件: ${msg.file.name} (${this._formatFileSize(fileSize)})`);
+        this._updateWebviewContent();
+
+        // 通知 webview 进度
+        if (this._view) {
+            this._view.webview.postMessage({
+                type: 'transferProgress',
+                taskId: transferKey,
+                status: 'transferring',
+                progress: 50,
+                transferredBytes: fileSize,
+                totalBytes: fileSize
+            });
+        }
+
+        // 确定保存路径
+        const downloadPath = this._getDownloadPath(msg.file.name);
+        const dir = path.dirname(downloadPath);
+        if (!fs.existsSync(dir)) {
+            fs.mkdirSync(dir, { recursive: true });
+        }
+
+        try {
+            // 写入文件（base64 解码）
+            const buffer = Buffer.from(msg.file.data, 'base64');
+            fs.writeFileSync(downloadPath, buffer);
+
+            // 更新会话状态
+            const session = this._sessions.find(s => s.peerId === msg.from);
+            if (session) {
+                session.transferStatus = 'completed';
+                session.transferProgress = 100;
+                this._saveSessions();
+            }
+
+            // 添加系统消息
+            this._addSystemMessage(`✅ 已接收来自 ${displayName} 的文件: ${msg.file.name} (${this._formatFileSize(fileSize)})\n📁 保存位置: ${downloadPath}`);
+
+            // 通知 webview 完成
+            if (this._view) {
+                this._view.webview.postMessage({
+                    type: 'transferProgress',
+                    taskId: transferKey,
+                    status: 'completed',
+                    progress: 100,
+                    transferredBytes: fileSize,
+                    totalBytes: fileSize
+                });
+            }
+
+            // 弹出通知
+            vscode.window.showInformationMessage(`已接收文件: ${msg.file.name}`);
+
+        } catch (err) {
+            const errorMsg = (err as Error).message;
+            console.error('文件接收失败:', errorMsg);
+
+            // 更新会话状态为失败
+            const session = this._sessions.find(s => s.peerId === msg.from);
+            if (session) {
+                session.transferStatus = 'failed';
+                this._saveSessions();
+            }
+
+            this._addSystemMessage(`❌ 文件接收失败: ${msg.file.name} - ${errorMsg}`);
+
+            vscode.window.showErrorMessage(`文件接收失败: ${msg.file.name}`);
+        }
+
+        this._updateWebviewContent();
+    }
+
+    private _updateReceiveProgressUI(transferKey: string, transfer: IncomingFileTransfer, progress: number): void {
+        // 更新会话中的传输状态
+        const session = this._sessions.find(s => s.peerId === transfer.peerId);
+        if (session) {
+            session.transferStatus = 'transferring';
+            session.transferProgress = progress;
+            this._saveSessions();
+        }
+
+        // 通知 webview 更新进度
+        if (this._view) {
+            this._view.webview.postMessage({
+                type: 'transferProgress',
+                taskId: transferKey,
+                status: 'transferring',
+                progress: progress,
+                transferredBytes: Math.floor((progress / 100) * transfer.fileSize),
+                totalBytes: transfer.fileSize
+            });
+        }
+    }
+
+    private _assembleAndSaveFile(transferKey: string, transfer: IncomingFileTransfer): void {
+        try {
+            // 按顺序组装所有块
+            let fileData = '';
+            for (let i = 0; i < transfer.totalChunks; i++) {
+                const chunk = transfer.chunks.get(i);
+                if (chunk === undefined) {
+                    throw new Error(`缺少文件块 ${i + 1}/${transfer.totalChunks}`);
+                }
+                fileData += chunk;
+            }
+
+            // 确定保存路径
+            const downloadPath = this._getDownloadPath(transfer.fileName);
+            const dir = path.dirname(downloadPath);
+            if (!fs.existsSync(dir)) {
+                fs.mkdirSync(dir, { recursive: true });
+            }
+
+            // 写入文件（base64 解码）
+            const buffer = Buffer.from(fileData, 'base64');
+            fs.writeFileSync(downloadPath, buffer);
+
+            // 清理传输记录
+            this._incomingFileTransfers.delete(transferKey);
+
+            // 更新会话状态
+            const session = this._sessions.find(s => s.peerId === transfer.peerId);
+            if (session) {
+                session.transferStatus = 'completed';
+                session.transferProgress = 100;
+                this._saveSessions();
+            }
+
+            // 添加系统消息
+            this._addSystemMessage(`✅ 已接收来自 ${transfer.peerName} 的文件: ${transfer.fileName} (${this._formatFileSize(transfer.fileSize)})\n📁 保存位置: ${downloadPath}`);
+
+            // 通知 webview 完成
+            if (this._view) {
+                this._view.webview.postMessage({
+                    type: 'transferProgress',
+                    taskId: transferKey,
+                    status: 'completed',
+                    progress: 100,
+                    transferredBytes: transfer.fileSize,
+                    totalBytes: transfer.fileSize
+                });
+            }
+
+            // 弹出通知
+            vscode.window.showInformationMessage(`已接收文件: ${transfer.fileName}`);
+
+        } catch (err) {
+            const errorMsg = (err as Error).message;
+            console.error('文件接收失败:', errorMsg);
+
+            // 更新会话状态为失败
+            const session = this._sessions.find(s => s.peerId === transfer.peerId);
+            if (session) {
+                session.transferStatus = 'failed';
+                this._saveSessions();
+            }
+
+            this._addSystemMessage(`❌ 文件接收失败: ${transfer.fileName} - ${errorMsg}`);
+
+            // 清理传输记录
+            this._incomingFileTransfers.delete(transferKey);
+
+            vscode.window.showErrorMessage(`文件接收失败: ${transfer.fileName}`);
+        }
+
+        this._updateWebviewContent();
     }
 
     private _updateReceiveProgress(msg: NetworkMessage): void {
         if (msg.progress) {
-            console.log(`Receive progress: ${msg.progress.percentage}%`);
-            // TODO: 更新接收进度显示
+            // 查找对应的传输任务
+            const transferKey = `${msg.from}:${msg.file?.name || 'unknown'}`;
+            const transfer = this._incomingFileTransfers.get(transferKey);
+            if (transfer) {
+                this._updateReceiveProgressUI(transferKey, transfer, msg.progress.percentage);
+            }
         }
     }
 

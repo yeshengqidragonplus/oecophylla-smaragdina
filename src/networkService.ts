@@ -3,6 +3,7 @@ import * as os from 'os';
 import * as events from 'events';
 import * as fs from 'fs';
 import * as path from 'path';
+import { KcpTransport } from './kcpTransport';
 
 export interface PeerInfo {
     id: string;
@@ -10,12 +11,14 @@ export interface PeerInfo {
     nickname?: string;
     ip: string;
     port: number;
+    kcpPort: number;
+    kcpSessionKey?: string;
     lastSeen: number;
     status: 'online' | 'offline';
 }
 
 export interface NetworkMessage {
-    type: 'message' | 'file' | 'handshake_request' | 'handshake_response' | 'file_chunk' | 'file_progress';
+    type: 'message' | 'file' | 'handshake_request' | 'handshake_response' | 'file_chunk' | 'file_progress' | 'kcp_offer' | 'kcp_accept';
     from: string;
     to?: string;
     content?: string;
@@ -32,6 +35,8 @@ export interface NetworkMessage {
         total: number;
         percentage: number;
     };
+    conv?: number;
+    kcpPort?: number;
 }
 
 export interface TransferTask {
@@ -59,10 +64,49 @@ export class NetworkService extends events.EventEmitter {
     private _isRunning: boolean = false;
     private _transferTasks: Map<string, TransferTask> = new Map();
     private _handshakeCallbacks: Map<string, { resolve: () => void; reject: (err: Error) => void; timeout: NodeJS.Timeout }> = new Map();
+    private _kcpTransport: KcpTransport;
 
     constructor() {
         super();
         this._hostname = os.hostname();
+        this._kcpTransport = new KcpTransport(this._port);
+        this._setupKcpEvents();
+    }
+
+    /**
+     * 设置 KCP 传输层事件监听
+     * KCP 通道处理所有业务消息（聊天、文件等）
+     */
+    private _setupKcpEvents(): void {
+        this._kcpTransport.on('data', (key: string, data: Buffer) => {
+            try {
+                const msg = JSON.parse(data.toString()) as NetworkMessage;
+                msg.from = key;
+                this.emit('message', msg);
+            } catch (err) {
+                console.error('Failed to parse KCP message:', err);
+            }
+        });
+
+        this._kcpTransport.on('sessionConnected', (key: string) => {
+            console.log(`KCP session connected: ${key}`);
+            const peer = this._peers.get(key);
+            if (peer) {
+                peer.kcpSessionKey = key;
+            }
+        });
+
+        this._kcpTransport.on('sessionClosed', (key: string) => {
+            console.log(`KCP session closed: ${key}`);
+            const peer = this._peers.get(key);
+            if (peer) {
+                peer.kcpSessionKey = undefined;
+            }
+        });
+    }
+
+    get kcpTransport(): KcpTransport {
+        return this._kcpTransport;
     }
 
     public async start(port: number, nickname?: string, peersFilePath?: string): Promise<void> {
@@ -70,9 +114,17 @@ export class NetworkService extends events.EventEmitter {
         this._nickname = nickname;
         this._isRunning = true;
 
-        // 从配置文件加载 peers
         if (peersFilePath) {
             this._loadPeersFromFile(peersFilePath);
+        }
+
+        this._kcpTransport = new KcpTransport(this._port);
+        this._setupKcpEvents();
+
+        try {
+            await this._kcpTransport.start();
+        } catch (err) {
+            console.error('Failed to start KCP transport:', err);
         }
 
         return new Promise((resolve, reject) => {
@@ -112,7 +164,7 @@ export class NetworkService extends events.EventEmitter {
                         ...peer,
                         id: peerId,
                         lastSeen: Date.now(),
-                        status: 'offline' // 初始状态为离线，握手后变为在线
+                        status: 'offline'
                     });
                 });
                 console.log(`Loaded ${peersArray.length} peers from ${filePath}`);
@@ -125,25 +177,32 @@ export class NetworkService extends events.EventEmitter {
 
     public stop(): void {
         this._isRunning = false;
-        
-        // 清除所有握手回调
+
         this._handshakeCallbacks.forEach((callback) => {
             clearTimeout(callback.timeout);
         });
         this._handshakeCallbacks.clear();
+
+        this._peers.forEach(peer => {
+            peer.kcpSessionKey = undefined;
+        });
+
+        this._kcpTransport.stop();
 
         if (this._udpServer) {
             this._udpServer.close();
             this._udpServer = null;
         }
 
-        // 标记所有 peers 为离线
         this._peers.forEach(peer => {
             peer.status = 'offline';
         });
         this.emit('peersUpdate', Array.from(this._peers.values()));
     }
 
+    /**
+     * UDP 通道仅处理发现/握手消息
+     */
     private _handleMessage(msg: Buffer, rinfo: dgram.RemoteInfo): void {
         try {
             const data = JSON.parse(msg.toString());
@@ -151,7 +210,6 @@ export class NetworkService extends events.EventEmitter {
             const peerPort = rinfo.port;
             const peerId = `${peerIp}:${peerPort}`;
 
-            // 不处理自己的消息
             if (peerIp === this.getLocalIp()) {
                 return;
             }
@@ -163,48 +221,69 @@ export class NetworkService extends events.EventEmitter {
                 case 'handshake_response':
                     this._handleHandshakeResponse(data, peerId);
                     break;
-                case 'message':
-                case 'file':
-                case 'file_chunk':
-                case 'file_progress':
-                    this.emit('message', data as NetworkMessage);
+                default:
                     break;
             }
         } catch (err) {
-            console.error('Failed to parse message:', err);
+            console.error('Failed to parse UDP message:', err);
         }
+    }
+
+    /**
+     * 确保与指定 peer 建立了 KCP 会话
+     */
+    private async _ensureKcpSession(peerId: string): Promise<string> {
+        const peer = this._peers.get(peerId);
+        if (!peer) {
+            throw new Error(`Peer ${peerId} not found`);
+        }
+
+        if (peer.kcpSessionKey && this._kcpTransport.hasSession(peer.kcpSessionKey)) {
+            return peer.kcpSessionKey;
+        }
+
+        const { key } = await this._kcpTransport.connectToPeer(peer.ip, peer.kcpPort);
+        peer.kcpSessionKey = key;
+        return key;
     }
 
     private _handleHandshakeRequest(data: NetworkMessage, ip: string, port: number): void {
         const peerId = `${ip}:${port}`;
-        
-        // 更新 peer 状态为在线
+        const kcpPort = data.kcpPort || (port + 1000);
+
         const existingPeer = this._peers.get(peerId);
         if (existingPeer) {
             existingPeer.lastSeen = Date.now();
             existingPeer.status = 'online';
+            existingPeer.kcpPort = kcpPort;
         } else {
             const peerInfo: PeerInfo = {
                 id: peerId,
                 hostname: data.from || ip,
                 ip: ip,
                 port: port,
+                kcpPort: kcpPort,
                 lastSeen: Date.now(),
                 status: 'online'
             };
             this._peers.set(peerId, peerInfo);
         }
-        
+
         this.emit('peersUpdate', Array.from(this._peers.values()));
 
-        // 发送响应
         const response: NetworkMessage = {
             type: 'handshake_response',
             from: this.getLocalIp(),
             to: peerId,
-            timestamp: Date.now()
+            timestamp: Date.now(),
+            kcpPort: this._kcpTransport.port
         };
         this._sendTo(ip, port, response);
+
+        // 主动建立到对端的 KCP 连接
+        this._ensureKcpSession(peerId).catch(err => {
+            console.error(`Failed to establish KCP session to ${peerId}:`, err);
+        });
     }
 
     private _handleHandshakeResponse(data: NetworkMessage, peerId: string): void {
@@ -214,10 +293,22 @@ export class NetworkService extends events.EventEmitter {
             this._handshakeCallbacks.delete(peerId);
             callback.resolve();
         }
+
+        if (data.kcpPort) {
+            const peer = this._peers.get(peerId);
+            if (peer) {
+                peer.kcpPort = data.kcpPort;
+            }
+        }
+
+        // 握手成功后建立 KCP 连接
+        this._ensureKcpSession(peerId).catch(err => {
+            console.error(`Failed to establish KCP session to ${peerId}:`, err);
+        });
     }
 
     /**
-     * 发送握手请求，5 秒超时
+     * 发送握手请求，5 秒超时（通过 UDP）
      */
     public async sendHandshake(peerId: string): Promise<boolean> {
         const peer = this._peers.get(peerId);
@@ -231,7 +322,8 @@ export class NetworkService extends events.EventEmitter {
                 type: 'handshake_request',
                 from: this.getLocalIp(),
                 to: peerId,
-                timestamp: Date.now()
+                timestamp: Date.now(),
+                kcpPort: this._kcpTransport.port
             };
 
             const timeout = setTimeout(() => {
@@ -246,8 +338,14 @@ export class NetworkService extends events.EventEmitter {
     }
 
     /**
-     * 创建传输任务
+     * 通过 KCP 发送消息到指定 peer
      */
+    private async _sendViaKcp(peerId: string, message: NetworkMessage): Promise<void> {
+        const sessionKey = await this._ensureKcpSession(peerId);
+        const data = Buffer.from(JSON.stringify(message));
+        await this._kcpTransport.send(sessionKey, data);
+    }
+
     public createTransferTask(
         peerId: string,
         messages: string[],
@@ -281,7 +379,7 @@ export class NetworkService extends events.EventEmitter {
     }
 
     /**
-     * 执行传输任务
+     * 执行传输任务，所有消息通过 KCP 可靠传输
      */
     public async executeTransferTask(taskId: string): Promise<void> {
         const task = this._transferTasks.get(taskId);
@@ -292,7 +390,6 @@ export class NetworkService extends events.EventEmitter {
         task.status = 'handshaking';
         this.emit('transferTaskUpdated', task);
 
-        // 先发送握手请求
         const handshakeSuccess = await this.sendHandshake(task.peerId);
         if (!handshakeSuccess) {
             task.status = 'timeout';
@@ -306,7 +403,8 @@ export class NetworkService extends events.EventEmitter {
         this.emit('transferTaskUpdated', task);
 
         try {
-            // 发送消息
+            await this._ensureKcpSession(task.peerId);
+
             for (const message of task.messages) {
                 const msg: NetworkMessage = {
                     type: 'message',
@@ -315,12 +413,11 @@ export class NetworkService extends events.EventEmitter {
                     content: message,
                     timestamp: Date.now()
                 };
-                this._sendTo(task.peerIp, task.peerPort, msg);
+                await this._sendViaKcp(task.peerId, msg);
             }
 
-            // 发送文件
             for (const file of task.files) {
-                await this._sendFileInChunks(task, file);
+                await this._sendFileViaKcp(task, file);
             }
 
             task.status = 'completed';
@@ -337,50 +434,29 @@ export class NetworkService extends events.EventEmitter {
         }
     }
 
-    private async _sendFileInChunks(task: TransferTask, file: { name: string; content: string; size: number }): Promise<void> {
-        const chunkSize = 1024; // 1KB per chunk
-        const totalChunks = Math.ceil(file.content.length / chunkSize);
+    private async _sendFileViaKcp(task: TransferTask, file: { name: string; content: string; size: number }): Promise<void> {
+        const fileMsg: NetworkMessage = {
+            type: 'file',
+            from: this.getLocalIp(),
+            to: task.peerId,
+            timestamp: Date.now(),
+            file: {
+                name: file.name,
+                size: file.size,
+                data: file.content
+            }
+        };
 
-        for (let i = 0; i < totalChunks; i++) {
-            const chunk = file.content.substr(i * chunkSize, chunkSize);
-            const msg: NetworkMessage = {
-                type: 'file_chunk',
-                from: this.getLocalIp(),
-                to: task.peerId,
-                timestamp: Date.now(),
-                file: {
-                    name: file.name,
-                    size: file.size,
-                    chunkIndex: i,
-                    totalChunks: totalChunks,
-                    data: chunk
-                }
-            };
-            this._sendTo(task.peerIp, task.peerPort, msg);
-            
-            task.transferredBytes += Buffer.byteLength(chunk);
-            task.progress = Math.floor((task.transferredBytes / task.totalBytes) * 100);
-            this.emit('transferTaskUpdated', task);
+        await this._sendViaKcp(task.peerId, fileMsg);
 
-            // 发送进度更新
-            const progressMsg: NetworkMessage = {
-                type: 'file_progress',
-                from: this.getLocalIp(),
-                to: task.peerId,
-                timestamp: Date.now(),
-                progress: {
-                    transferred: task.transferredBytes,
-                    total: task.totalBytes,
-                    percentage: task.progress
-                }
-            };
-            this._sendTo(task.peerIp, task.peerPort, progressMsg);
-
-            // 小延迟避免发送过快
-            await new Promise(resolve => setTimeout(resolve, 10));
-        }
+        task.transferredBytes += file.size;
+        task.progress = Math.floor((task.transferredBytes / task.totalBytes) * 100);
+        this.emit('transferTaskUpdated', task);
     }
 
+    /**
+     * 通过 UDP 发送（仅用于握手消息）
+     */
     private _sendTo(ip: string, port: number, message: NetworkMessage): void {
         if (!this._udpServer) {
             return;
@@ -389,13 +465,16 @@ export class NetworkService extends events.EventEmitter {
         this._udpServer.send(messageBuffer, 0, messageBuffer.length, port, ip);
     }
 
-    public sendToPeer(peerId: string, message: NetworkMessage): void {
+    /**
+     * 发送消息到指定 peer（通过 KCP 可靠传输）
+     */
+    public async sendToPeer(peerId: string, message: NetworkMessage): Promise<void> {
         const peer = this._peers.get(peerId);
         if (!peer) {
             console.error(`Peer ${peerId} not found`);
             return;
         }
-        this._sendTo(peer.ip, peer.port, message);
+        await this._sendViaKcp(peerId, message);
     }
 
     public getTransferTasks(): TransferTask[] {
@@ -416,7 +495,7 @@ export class NetworkService extends events.EventEmitter {
 
     public getLocalIp(): string {
         const interfaces = os.networkInterfaces();
-        
+
         for (const name of Object.keys(interfaces)) {
             const iface = interfaces[name];
             if (!iface) { continue; }
@@ -427,7 +506,7 @@ export class NetworkService extends events.EventEmitter {
                 }
             }
         }
-        
+
         return '127.0.0.1';
     }
 }
