@@ -160,7 +160,7 @@ suite('Extension Test Suite', () => {
                 hostname: 'PC-Test',
                 ip: '192.168.1.100',
                 port: 8080,
-                kcpPort: 9080,
+                transferPort: 9080,
                 lastSeen: Date.now(),
                 status: 'online'
             };
@@ -176,7 +176,7 @@ suite('Extension Test Suite', () => {
                 hostname: 'PC-Test',
                 ip: '192.168.1.100',
                 port: 8080,
-                kcpPort: 9080,
+                transferPort: 9080,
                 lastSeen: Date.now(),
                 status: 'online'
             };
@@ -189,19 +189,6 @@ suite('Extension Test Suite', () => {
 
             // 触发 peersUpdate 事件
             networkService.emit('peersUpdate', [testPeer]);
-        });
-
-        test('should handle handshake request', () => {
-            const msg: NetworkMessage = {
-                type: 'handshake_request',
-                from: 'PC-remote',
-                timestamp: Date.now()
-            };
-
-            // 模拟收到握手请求
-            networkService.emit('message', msg);
-            // 握手请求应该被处理，不会抛出异常
-            assert.ok(true);
         });
 
         test('should handle message event', (done) => {
@@ -223,27 +210,6 @@ suite('Extension Test Suite', () => {
     });
 
     suite('NetworkMessage Structure', () => {
-        test('should create valid handshake request', () => {
-            const msg: NetworkMessage = {
-                type: 'handshake_request',
-                from: '192.168.1.100',
-                timestamp: Date.now()
-            };
-            assert.strictEqual(msg.type, 'handshake_request');
-            assert.ok(msg.timestamp > 0);
-        });
-
-        test('should create valid handshake response', () => {
-            const msg: NetworkMessage = {
-                type: 'handshake_response',
-                from: '192.168.1.100',
-                to: '192.168.1.101:8080',
-                timestamp: Date.now()
-            };
-            assert.strictEqual(msg.type, 'handshake_response');
-            assert.ok(msg.to);
-        });
-
         test('should create valid chat message', () => {
             const msg: NetworkMessage = {
                 type: 'message',
@@ -278,12 +244,12 @@ suite('Extension Test Suite', () => {
                 fromHostname: 'PC-Test',
                 fromNickname: '测试用户',
                 timestamp: Date.now(),
-                kcpPort: 9080
+                transferPort: 9080
             };
             assert.strictEqual(msg.type, 'discovery_request');
             assert.strictEqual(msg.fromHostname, 'PC-Test');
             assert.strictEqual(msg.fromNickname, '测试用户');
-            assert.strictEqual(msg.kcpPort, 9080);
+            assert.strictEqual(msg.transferPort, 9080);
         });
 
         test('should create valid discovery response message', () => {
@@ -293,7 +259,7 @@ suite('Extension Test Suite', () => {
                 fromHostname: 'PC-Remote',
                 to: '192.168.1.100:8080',
                 timestamp: Date.now(),
-                kcpPort: 9080
+                transferPort: 9080
             };
             assert.strictEqual(msg.type, 'discovery_response');
             assert.strictEqual(msg.fromHostname, 'PC-Remote');
@@ -306,7 +272,7 @@ suite('Extension Test Suite', () => {
                 fromHostname: 'PC-Test',
                 to: '192.168.1.101:8080',
                 timestamp: Date.now(),
-                kcpPort: 9080
+                transferPort: 9080
             };
             assert.strictEqual(msg.type, 'heartbeat');
             assert.strictEqual(msg.fromHostname, 'PC-Test');
@@ -319,7 +285,7 @@ suite('Extension Test Suite', () => {
                 fromHostname: 'PC-Remote',
                 to: '192.168.1.100:8080',
                 timestamp: Date.now(),
-                kcpPort: 9080
+                transferPort: 9080
             };
             assert.strictEqual(msg.type, 'heartbeat_ack');
             assert.strictEqual(msg.fromHostname, 'PC-Remote');
@@ -334,7 +300,7 @@ suite('Extension Test Suite', () => {
                 peerIp: '192.168.1.100',
                 peerPort: 8080,
                 messages: ['hello'],
-                files: [{ name: 'test.txt', content: 'base64', size: 100 }],
+                files: [{ name: 'test.txt', path: '/tmp/test.txt', size: 100 }],
                 status: 'pending',
                 progress: 0,
                 totalBytes: 100,
@@ -362,8 +328,8 @@ suite('Extension Test Suite', () => {
                 createdAt: Date.now()
             };
 
-            task.status = 'handshaking';
-            assert.strictEqual(task.status, 'handshaking');
+            task.status = 'connecting';
+            assert.strictEqual(task.status, 'connecting');
 
             task.status = 'transferring';
             task.progress = 50;

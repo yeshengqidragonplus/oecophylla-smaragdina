@@ -50,7 +50,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     private _lastSelectedPeerId: string | null = null;
     private _context: vscode.ExtensionContext;
     private _peersManager: PeersManager;
-    private _selectedFiles: Map<string, { name: string; path: string; content: string; size: number }> = new Map();
+    private _selectedFiles: Map<string, { name: string; path: string; size: number }> = new Map();
     private _activeTransferTasks: Map<string, TransferTask> = new Map();
     /** 接收中的文件传输 key: `${peerId}:${fileName}` */
     private _incomingFileTransfers: Map<string, IncomingFileTransfer> = new Map();
@@ -321,23 +321,65 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         const peer = this._peersManager.getPeerById(msg.from);
         const displayName = peer ? this._peersManager.getPeerDisplayName(peer) : msg.from;
 
-        let content = '';
-        if (msg.type === 'message') {
-            content = `📨 来自 ${displayName}:\n${msg.content || ''}`;
-        } else if (msg.type === 'file') {
-            // 通过 KCP 接收完整文件
-            this._handleIncomingFile(msg, displayName);
+        if (msg.type === 'file') {
+            this._handleFileChunk(msg, displayName);
+            return;
+        }
+
+        if (msg.type !== 'message') {
             return;
         }
 
         const incomingMessage: ChatMessage = {
-            id: Date.now().toString(),
+            id: `${Date.now()}_${Math.random().toString(36).substr(2, 6)}`,
             type: 'assistant',
-            content: content,
+            content: `📨 来自 ${displayName}:\n${msg.content || ''}`,
             timestamp: Date.now()
         };
 
-        this._addMessageToCurrentSession(incomingMessage);
+        // 按发送方归入对应会话，而不是塞进当前打开的会话
+        const session = this._getOrCreateSessionForPeer(msg.from, displayName);
+        this._appendMessageToSession(session, incomingMessage);
+        this._updateWebviewContent();
+    }
+
+    /**
+     * 查找或创建与指定 peer 关联的会话
+     */
+    private _getOrCreateSessionForPeer(peerId: string, displayName: string): ChatSession {
+        let session = this._sessions.find(s => s.peerId === peerId);
+        if (!session) {
+            session = {
+                id: `${Date.now()}_${Math.random().toString(36).substr(2, 6)}`,
+                title: displayName,
+                peerId: peerId,
+                peerName: displayName,
+                messages: [],
+                lastUpdated: Date.now()
+            };
+            this._sessions.unshift(session);
+            // 没有打开任何会话时，自动切到新消息所在会话
+            if (!this._currentSessionId) {
+                this._currentSessionId = session.id;
+            }
+        }
+        return session;
+    }
+
+    private _appendMessageToSession(session: ChatSession, message: ChatMessage): void {
+        session.messages.push(message);
+        session.lastUpdated = Date.now();
+        this._saveSessions();
+    }
+
+    private _addSystemMessageToPeerSession(peerId: string, displayName: string, content: string): void {
+        const session = this._getOrCreateSessionForPeer(peerId, displayName);
+        this._appendMessageToSession(session, {
+            id: `${Date.now()}_${Math.random().toString(36).substr(2, 6)}`,
+            type: 'system',
+            content: content,
+            timestamp: Date.now()
+        });
         this._updateWebviewContent();
     }
 
@@ -364,8 +406,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
             this._incomingFileTransfers.set(transferKey, transfer);
 
             // 添加系统消息：开始接收
-            this._addSystemMessage(`📥 正在接收来自 ${displayName} 的文件: ${msg.file.name} (${this._formatFileSize(msg.file.size)})`);
-            this._updateWebviewContent();
+            this._addSystemMessageToPeerSession(msg.from, displayName, `📥 正在接收来自 ${displayName} 的文件: ${msg.file.name} (${this._formatFileSize(msg.file.size)})`);
         }
 
         // 如果该块已接收过，跳过
@@ -385,90 +426,6 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         if (transfer.receivedChunks >= transfer.totalChunks) {
             this._assembleAndSaveFile(transferKey, transfer);
         }
-    }
-
-    /**
-     * 处理通过 KCP 可靠传输接收的完整文件
-     */
-    private _handleIncomingFile(msg: NetworkMessage, displayName: string): void {
-        if (!msg.file || !msg.file.data) {
-            return;
-        }
-
-        const transferKey = `${msg.from}:${msg.file.name}`;
-        const fileSize = msg.file.size || msg.file.data.length;
-
-        // 添加系统消息：开始接收
-        this._addSystemMessage(`📥 正在接收来自 ${displayName} 的文件: ${msg.file.name} (${this._formatFileSize(fileSize)})`);
-        this._updateWebviewContent();
-
-        // 通知 webview 进度
-        if (this._view) {
-            this._view.webview.postMessage({
-                type: 'transferProgress',
-                taskId: transferKey,
-                status: 'transferring',
-                progress: 50,
-                transferredBytes: fileSize,
-                totalBytes: fileSize
-            });
-        }
-
-        // 确定保存路径
-        const downloadPath = this._getDownloadPath(msg.file.name);
-        const dir = path.dirname(downloadPath);
-        if (!fs.existsSync(dir)) {
-            fs.mkdirSync(dir, { recursive: true });
-        }
-
-        try {
-            // 写入文件（base64 解码）
-            const buffer = Buffer.from(msg.file.data, 'base64');
-            fs.writeFileSync(downloadPath, buffer);
-
-            // 更新会话状态
-            const session = this._sessions.find(s => s.peerId === msg.from);
-            if (session) {
-                session.transferStatus = 'completed';
-                session.transferProgress = 100;
-                this._saveSessions();
-            }
-
-            // 添加系统消息
-            this._addSystemMessage(`✅ 已接收来自 ${displayName} 的文件: ${msg.file.name} (${this._formatFileSize(fileSize)})\n📁 保存位置: ${downloadPath}`);
-
-            // 通知 webview 完成
-            if (this._view) {
-                this._view.webview.postMessage({
-                    type: 'transferProgress',
-                    taskId: transferKey,
-                    status: 'completed',
-                    progress: 100,
-                    transferredBytes: fileSize,
-                    totalBytes: fileSize
-                });
-            }
-
-            // 弹出通知
-            vscode.window.showInformationMessage(`已接收文件: ${msg.file.name}`);
-
-        } catch (err) {
-            const errorMsg = (err as Error).message;
-            console.error('文件接收失败:', errorMsg);
-
-            // 更新会话状态为失败
-            const session = this._sessions.find(s => s.peerId === msg.from);
-            if (session) {
-                session.transferStatus = 'failed';
-                this._saveSessions();
-            }
-
-            this._addSystemMessage(`❌ 文件接收失败: ${msg.file.name} - ${errorMsg}`);
-
-            vscode.window.showErrorMessage(`文件接收失败: ${msg.file.name}`);
-        }
-
-        this._updateWebviewContent();
     }
 
     private _updateReceiveProgressUI(transferKey: string, transfer: IncomingFileTransfer, progress: number): void {
@@ -528,7 +485,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
             }
 
             // 添加系统消息
-            this._addSystemMessage(`✅ 已接收来自 ${transfer.peerName} 的文件: ${transfer.fileName} (${this._formatFileSize(transfer.fileSize)})\n📁 保存位置: ${downloadPath}`);
+            this._addSystemMessageToPeerSession(transfer.peerId, transfer.peerName, `✅ 已接收来自 ${transfer.peerName} 的文件: ${transfer.fileName} (${this._formatFileSize(transfer.fileSize)})\n📁 保存位置: ${downloadPath}`);
 
             // 通知 webview 完成
             if (this._view) {
@@ -556,7 +513,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
                 this._saveSessions();
             }
 
-            this._addSystemMessage(`❌ 文件接收失败: ${transfer.fileName} - ${errorMsg}`);
+            this._addSystemMessageToPeerSession(transfer.peerId, transfer.peerName, `❌ 文件接收失败: ${transfer.fileName} - ${errorMsg}`);
 
             // 清理传输记录
             this._incomingFileTransfers.delete(transferKey);
@@ -565,17 +522,6 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         }
 
         this._updateWebviewContent();
-    }
-
-    private _updateReceiveProgress(msg: NetworkMessage): void {
-        if (msg.progress) {
-            // 查找对应的传输任务
-            const transferKey = `${msg.from}:${msg.file?.name || 'unknown'}`;
-            const transfer = this._incomingFileTransfers.get(transferKey);
-            if (transfer) {
-                this._updateReceiveProgressUI(transferKey, transfer, msg.progress.percentage);
-            }
-        }
     }
 
     private _formatFileSize(bytes: number): string {
@@ -587,12 +533,24 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     private _getDownloadPath(fileName: string): string {
         const config = vscode.workspace.getConfiguration('oschat');
         const customPath = config.get<string>('downloadPath', '');
-        
-        if (customPath) {
-            return path.join(customPath, fileName);
-        } else {
-            return path.join(this._context.globalStorageUri.fsPath, 'downloads', fileName);
+        const baseDir = customPath || path.join(this._context.globalStorageUri.fsPath, 'downloads');
+
+        // 防止路径穿越：只取文件名部分，并过滤非法字符
+        const safeName = path.basename(fileName).replace(/[\\/:*?"<>|]/g, '_') || 'received_file';
+
+        // 同名文件不覆盖，自动加序号
+        let target = path.join(baseDir, safeName);
+        if (fs.existsSync(target)) {
+            const ext = path.extname(safeName);
+            const stem = path.basename(safeName, ext);
+            for (let i = 1; ; i++) {
+                target = path.join(baseDir, `${stem} (${i})${ext}`);
+                if (!fs.existsSync(target)) {
+                    break;
+                }
+            }
         }
+        return target;
     }
 
     private async _handleFileSelect(): Promise<void> {
@@ -604,23 +562,16 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         });
 
         if (fileUris && fileUris.length > 0) {
-            const files = fileUris.map(uri => ({
-                fileName: path.basename(uri.fsPath),
-                fileContent: fs.readFileSync(uri.fsPath, 'base64'),
-                filePath: uri.fsPath,
-                fileSize: fs.statSync(uri.fsPath).size
-            }));
-            
-            files.forEach(file => {
-                const uniqueId = `${file.filePath}_${Date.now()}_${Math.random()}`;
+            // 只记录元信息，文件内容在发送时分块流式读取，避免大文件驻留内存
+            fileUris.forEach(uri => {
+                const uniqueId = `${uri.fsPath}_${Date.now()}_${Math.random()}`;
                 this._selectedFiles.set(uniqueId, {
-                    name: file.fileName,
-                    path: file.filePath,
-                    content: file.fileContent,
-                    size: file.fileSize
+                    name: path.basename(uri.fsPath),
+                    path: uri.fsPath,
+                    size: fs.statSync(uri.fsPath).size
                 });
             });
-            
+
             this._updateFileListInWebview();
         }
     }
@@ -697,13 +648,13 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 
         // 准备发送内容
         const messages: string[] = content.trim() ? [content] : [];
-        const files: { name: string; content: string; size: number }[] = [];
+        const files: { name: string; path: string; size: number }[] = [];
 
         // 添加选中的文件
         this._selectedFiles.forEach(file => {
             files.push({
                 name: file.name,
-                content: file.content,
+                path: file.path,
                 size: file.size
             });
         });
@@ -745,7 +696,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         } catch (error) {
             const errorMessage = (error as Error).message;
             
-            if (errorMessage.includes('Handshake timeout')) {
+            if (errorMessage.includes('Connect timeout')) {
                 this._addSystemMessage(`❌ 连接超时: ${displayName} 可能不在线`);
                 
                 // 更新会话状态为失败
