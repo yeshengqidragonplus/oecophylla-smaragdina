@@ -16,6 +16,8 @@ export class PeersManager {
     private _peersFilePath: string = '';
     private _peers: Map<string, StoredPeerInfo> = new Map();
     private _context: vscode.ExtensionContext;
+    /** 写盘防抖定时器：心跳等高频更新合并为一次写入 */
+    private _saveTimer: NodeJS.Timeout | null = null;
 
     constructor(context: vscode.ExtensionContext) {
         this._context = context;
@@ -96,29 +98,65 @@ export class PeersManager {
     }
 
     /**
-     * 添加或更新 peer
+     * 添加或更新 peer。
+     * lastSeen 只在内存中更新；仅当有意义的字段（状态/地址/名称）变化时才写盘。
      */
     public updatePeer(peerInfo: StoredPeerInfo): void {
         const existingPeer = this._peers.get(peerInfo.id);
-        
+
         if (existingPeer) {
-            // 更新现有 peer
             existingPeer.lastSeen = peerInfo.lastSeen;
-            existingPeer.status = peerInfo.status;
-            existingPeer.ip = peerInfo.ip;
-            existingPeer.port = peerInfo.port;
-            if (peerInfo.nickname) {
-                existingPeer.nickname = peerInfo.nickname;
+
+            let changed = false;
+            if (existingPeer.status !== peerInfo.status) {
+                existingPeer.status = peerInfo.status;
+                changed = true;
             }
-            if (peerInfo.hostname) {
+            if (existingPeer.ip !== peerInfo.ip || existingPeer.port !== peerInfo.port) {
+                existingPeer.ip = peerInfo.ip;
+                existingPeer.port = peerInfo.port;
+                changed = true;
+            }
+            if (peerInfo.nickname && existingPeer.nickname !== peerInfo.nickname) {
+                existingPeer.nickname = peerInfo.nickname;
+                changed = true;
+            }
+            if (peerInfo.hostname && existingPeer.hostname !== peerInfo.hostname) {
                 existingPeer.hostname = peerInfo.hostname;
+                changed = true;
+            }
+
+            if (changed) {
+                this._scheduleSave();
             }
         } else {
-            // 添加新 peer
             this._peers.set(peerInfo.id, { ...peerInfo });
+            this._scheduleSave();
         }
+    }
 
-        this._savePeers();
+    /**
+     * 防抖写盘：2 秒内的多次更新合并为一次
+     */
+    private _scheduleSave(): void {
+        if (this._saveTimer) {
+            return;
+        }
+        this._saveTimer = setTimeout(() => {
+            this._saveTimer = null;
+            this._savePeers();
+        }, 2000);
+    }
+
+    /**
+     * 立即落盘待保存的更改（插件停用时调用）
+     */
+    public flush(): void {
+        if (this._saveTimer) {
+            clearTimeout(this._saveTimer);
+            this._saveTimer = null;
+            this._savePeers();
+        }
     }
 
     /**

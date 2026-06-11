@@ -145,5 +145,8 @@ async function startNetworkService(port: number, nickname: string, peersFilePath
 
 export function deactivate() {
     networkService.stop();
+    if (peersManager) {
+        peersManager.flush();
+    }
     console.log('OS Chat 已停用');
 }
