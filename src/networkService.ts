@@ -2,7 +2,7 @@ import * as dgram from 'dgram';
 import * as os from 'os';
 import * as events from 'events';
 import * as fs from 'fs';
-import { TcpTransport } from './tcpTransport';
+import { KcpTransport } from './kcpTransport';
 
 export interface PeerInfo {
     id: string;
@@ -10,7 +10,7 @@ export interface PeerInfo {
     nickname?: string;
     ip: string;
     port: number;
-    /** 对端业务消息（TCP）端口 */
+    /** 对端业务消息（KCP）端口 */
     transferPort: number;
     lastSeen: number;
     status: 'online' | 'offline';
@@ -66,7 +66,7 @@ const DISCOVERY_INTERVAL = 60_000;
 const DISCOVERY_PORT = 41320;
 /** 文件分块大小（原始字节，发送时转 base64） */
 const FILE_CHUNK_SIZE = 64 * 1024;
-/** TCP 建连超时（毫秒） */
+/** KCP 握手建连超时（毫秒） */
 const CONNECT_TIMEOUT = 5_000;
 
 export class NetworkService extends events.EventEmitter {
@@ -79,7 +79,7 @@ export class NetworkService extends events.EventEmitter {
     private _peers: Map<string, PeerInfo> = new Map();
     private _isRunning: boolean = false;
     private _transferTasks: Map<string, TransferTask> = new Map();
-    private _transport: TcpTransport | null = null;
+    private _transport: KcpTransport | null = null;
 
     /** 本机所有 IPv4 地址（含回环），用于过滤自己发出的广播 */
     private _localIps: Set<string> = new Set();
@@ -93,7 +93,7 @@ export class NetworkService extends events.EventEmitter {
         this._hostname = os.hostname();
     }
 
-    get transport(): TcpTransport | null {
+    get transport(): KcpTransport | null {
         return this._transport;
     }
 
@@ -110,8 +110,8 @@ export class NetworkService extends events.EventEmitter {
             this._loadPeersFromFile(peersFilePath);
         }
 
-        // 启动 TCP 传输层（业务消息通道）
-        this._transport = new TcpTransport(this._port);
+        // 启动 KCP 传输层（业务消息通道）
+        this._transport = new KcpTransport(this._port);
         this._transport.setLocalId(this._localPeerId());
         this._setupTransportEvents();
 
@@ -121,7 +121,7 @@ export class NetworkService extends events.EventEmitter {
             this._transport.removeAllListeners();
             this._transport.stop();
             this._transport = null;
-            throw new Error(`TCP 传输层启动失败（端口 ${this._port + 1000}）: ${(err as Error).message}`);
+            throw new Error(`KCP 传输层启动失败（端口 ${this._port + 1000}）: ${(err as Error).message}`);
         }
 
         // 启动主 UDP 通道（发现/心跳）
@@ -427,10 +427,10 @@ export class NetworkService extends events.EventEmitter {
         this._upsertPeerFromUdp(msg, ip, port, 'Heartbeat');
     }
 
-    // ==================== TCP 传输层事件 ====================
+    // ==================== KCP 传输层事件 ====================
 
     /**
-     * TCP 通道处理所有业务消息（聊天、文件）
+     * KCP 通道处理所有业务消息（聊天、文件）
      */
     private _setupTransportEvents(): void {
         if (!this._transport) {
@@ -443,12 +443,12 @@ export class NetworkService extends events.EventEmitter {
                 msg.from = peerId;
                 this.emit('message', msg);
             } catch (err) {
-                console.error('Failed to parse TCP message:', err);
+                console.error('Failed to parse KCP message:', err);
             }
         });
 
         this._transport.on('sessionConnected', (peerId: string) => {
-            console.log(`TCP session connected: ${peerId}`);
+            console.log(`KCP session connected: ${peerId}`);
             const peer = this._peers.get(peerId);
             if (peer) {
                 peer.lastSeen = Date.now();
@@ -460,11 +460,11 @@ export class NetworkService extends events.EventEmitter {
         });
 
         this._transport.on('sessionClosed', (peerId: string) => {
-            console.log(`TCP session closed: ${peerId}`);
+            console.log(`KCP session closed: ${peerId}`);
         });
 
         this._transport.on('sessionError', (peerId: string, err: Error) => {
-            console.error(`TCP session error (${peerId}):`, err.message);
+            console.error(`KCP session error (${peerId}):`, err.message);
         });
     }
 
@@ -575,7 +575,7 @@ export class NetworkService extends events.EventEmitter {
      * 解析 peerId 对应的 PeerInfo。
      * 若不在已知列表（如启动后才在 peers 编辑器中新增的对象），
      * 则按 peerId 的 `ip:端口` 约定即时补建一条记录——
-     * TCP 建连（5 秒超时）本身就是在线检测，无需等发现/心跳。
+     * KCP 握手建连（5 秒超时）本身就是在线检测，无需等发现/心跳。
      */
     private _resolvePeer(peerId: string): PeerInfo {
         const existing = this._peers.get(peerId);
@@ -603,7 +603,7 @@ export class NetworkService extends events.EventEmitter {
     }
 
     /**
-     * 确保与指定 peer 建立了 TCP 会话
+     * 确保与指定 peer 建立了 KCP 会话
      */
     private async _ensureSession(peerId: string): Promise<void> {
         const peer = this._resolvePeer(peerId);
@@ -617,7 +617,7 @@ export class NetworkService extends events.EventEmitter {
     }
 
     /**
-     * 通过 TCP 发送消息到指定 peer
+     * 通过 KCP 发送消息到指定 peer
      */
     private async _sendViaTransport(peerId: string, message: NetworkMessage): Promise<void> {
         await this._ensureSession(peerId);
@@ -655,7 +655,7 @@ export class NetworkService extends events.EventEmitter {
     }
 
     /**
-     * 执行传输任务，所有消息通过 TCP 可靠传输。
+     * 执行传输任务，所有消息通过 KCP 可靠传输。
      * 连接建立本身就是在线检测（5 秒超时），不再额外握手。
      */
     public async executeTransferTask(taskId: string): Promise<void> {
@@ -766,7 +766,7 @@ export class NetworkService extends events.EventEmitter {
     }
 
     /**
-     * 发送消息到指定 peer（通过 TCP 可靠传输）
+     * 发送消息到指定 peer（通过 KCP 可靠传输）
      */
     public async sendToPeer(peerId: string, message: NetworkMessage): Promise<void> {
         await this._sendViaTransport(peerId, message);
