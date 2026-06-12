@@ -1,9 +1,27 @@
 # Change Log
 
-All notable changes to the "oecophylla-smaragdina" extension will be documented in this file.
-
-Check [Keep a Changelog](http://keepachangelog.com/) for recommendations on how to structure this file.
+本插件的重要变更记录于此文件，格式参考 [Keep a Changelog](http://keepachangelog.com/)。
 
 ## [Unreleased]
 
-- Initial release
+### 新增
+
+- 侧边栏聊天界面：一对一会话、文本消息、文件传输（64KB 分块、实时进度）
+- 局域网自动发现：UDP 广播 + 固定共享发现端口 41320，支持同一台机器多实例互相发现
+- 心跳在线检测：30 秒心跳、90 秒超时离线
+- 聊天对象持久化（peers.json，路径可配置，写盘防抖）
+- peers 编辑面板与设置面板
+- 界面主题：跟随 VS Code / 浅色 / 深色
+- 端到端冒烟测试脚本 `smoke-test.js`（不依赖 VS Code）
+- 设计文档 `docs/DESIGN.md`
+
+### 变更
+
+- 业务消息传输层由 KCP（kcpjs，依赖原生模块）重构为 Node 内置 TCP：
+  4 字节长度前缀帧 + 身份帧协议 + 双向建连仲裁，移除全部原生模块依赖
+- 文件发送改为流式分块读盘，大文件不再整体驻留内存
+
+### 安全
+
+- 接收文件名经 `path.basename` + 非法字符过滤，防路径穿越；同名文件加序号不覆盖
+- TCP 单帧上限 64MB，防止异常数据导致内存暴涨
