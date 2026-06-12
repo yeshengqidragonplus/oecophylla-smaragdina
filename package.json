@@ -17,7 +17,8 @@
     "onCommand:myChat.startNetwork",
     "onCommand:myChat.stopNetwork",
     "onCommand:myChat.editPeers",
-    "onCommand:myChat.openPeersFile"
+    "onCommand:myChat.openPeersFile",
+    "onCommand:myChat.showLogs"
   ],
   "main": "./dist/extension.js",
   "contributes": {
@@ -71,6 +72,11 @@
         "command": "myChat.openPeersFile",
         "title": "打开 peers.json 配置文件",
         "icon": "$(file-code)"
+      },
+      {
+        "command": "myChat.showLogs",
+        "title": "OSChat: 显示日志",
+        "icon": "$(output)"
       }
     ],
     "menus": {

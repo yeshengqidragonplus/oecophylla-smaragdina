@@ -1,6 +1,7 @@
 import * as dgram from 'dgram';
 import * as events from 'events';
 import { Kcp } from './kcp';
+import { log, logError } from './logger';
 
 /**
  * KCP 传输层 - 承载所有业务消息（聊天、文件）
@@ -121,7 +122,7 @@ export class KcpTransport extends events.EventEmitter {
             socket.bind(this._port, () => {
                 this._isRunning = true;
                 this._updateTimer = setInterval(() => this._updateAll(), UPDATE_INTERVAL);
-                console.log(`KCP Transport listening on UDP port ${this._port}`);
+                log(`KCP Transport listening on UDP port ${this._port}`);
                 resolve();
             });
             this._socket = socket;
@@ -152,7 +153,7 @@ export class KcpTransport extends events.EventEmitter {
             this._socket = null;
         }
 
-        console.log('KCP Transport stopped');
+        log('KCP Transport stopped');
     }
 
     hasSession(peerId: string): boolean {
@@ -347,7 +348,7 @@ export class KcpTransport extends events.EventEmitter {
         this._sessions.set(peerId, session);
         this._convIndex.set(conv, session);
         this._sendControl(rinfo.address, rinfo.port, { t: 'ack', conv, id: this._localId });
-        console.log(`KCP inbound session established: ${peerId}`);
+        log(`KCP inbound session established: ${peerId}`);
         this.emit('sessionConnected', peerId);
         this.emit('_established', peerId);
     }
@@ -363,7 +364,7 @@ export class KcpTransport extends events.EventEmitter {
         }
         session.established = true;
         session.lastActive = Date.now();
-        console.log(`KCP connected to ${session.peerId}`);
+        log(`KCP connected to ${session.peerId}`);
         this.emit('_established', session.peerId);
     }
 
@@ -411,7 +412,7 @@ export class KcpTransport extends events.EventEmitter {
         while (session.recvBuffer.length >= 4) {
             const frameLength = session.recvBuffer.readUInt32BE(0);
             if (frameLength > KcpTransport.MAX_FRAME_SIZE) {
-                console.error(`KCP frame too large (${frameLength} bytes), closing session`);
+                logError(`KCP frame too large (${frameLength} bytes), closing session`);
                 this.disconnect(session.peerId);
                 return;
             }
@@ -468,7 +469,7 @@ export class KcpTransport extends events.EventEmitter {
             session.kcp.update(now & 0xffffffff);
 
             if (session.kcp.isDeadLink) {
-                console.error(`KCP dead link: ${session.peerId}`);
+                logError(`KCP dead link: ${session.peerId}`);
                 this.emit('sessionError', session.peerId, new Error('KCP 链路死亡（重传超限）'));
                 this._destroySession(session, true);
                 continue;

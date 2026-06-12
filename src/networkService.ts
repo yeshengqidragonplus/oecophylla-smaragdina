@@ -3,6 +3,7 @@ import * as os from 'os';
 import * as events from 'events';
 import * as fs from 'fs';
 import { KcpTransport } from './kcpTransport';
+import { log, logError } from './logger';
 
 export interface PeerInfo {
     id: string;
@@ -155,7 +156,7 @@ export class NetworkService extends events.EventEmitter {
             const udpServer = dgram.createSocket({ type: 'udp4', reuseAddr: true });
 
             udpServer.on('error', (err) => {
-                console.error('UDP Server error:', err);
+                logError('UDP Server error:', err);
                 if (!settled) {
                     settled = true;
                     udpServer.close();
@@ -173,7 +174,7 @@ export class NetworkService extends events.EventEmitter {
                 try {
                     udpServer.setBroadcast(true);
                 } catch (_) { /* ignore */ }
-                console.log(`UDP Server listening on port ${port}`);
+                log(`UDP Server listening on port ${port}`);
                 settled = true;
                 this._udpServer = udpServer;
                 resolve();
@@ -191,7 +192,7 @@ export class NetworkService extends events.EventEmitter {
         try {
             const socket = dgram.createSocket({ type: 'udp4', reuseAddr: true });
             socket.on('error', err => {
-                console.error('Discovery socket error:', err.message);
+                logError('Discovery socket error:', err.message);
             });
             socket.on('message', (msg, rinfo) => {
                 try {
@@ -203,11 +204,11 @@ export class NetworkService extends events.EventEmitter {
                 } catch (_) { /* ignore */ }
             });
             socket.bind(DISCOVERY_PORT, () => {
-                console.log(`Discovery socket listening on shared port ${DISCOVERY_PORT}`);
+                log(`Discovery socket listening on shared port ${DISCOVERY_PORT}`);
             });
             this._discoverySocket = socket;
         } catch (err) {
-            console.error('Failed to bind discovery socket:', err);
+            logError('Failed to bind discovery socket:', err);
         }
     }
 
@@ -236,7 +237,7 @@ export class NetworkService extends events.EventEmitter {
         try {
             this._udpServer.send(buffer, 0, buffer.length, DISCOVERY_PORT, '255.255.255.255');
         } catch (err) {
-            console.error('Failed to send discovery broadcast:', err);
+            logError('Failed to send discovery broadcast:', err);
         }
 
         // 也向子网广播地址发送
@@ -245,7 +246,7 @@ export class NetworkService extends events.EventEmitter {
             try {
                 this._udpServer.send(buffer, 0, buffer.length, DISCOVERY_PORT, subnetBroadcast);
             } catch (err) {
-                console.error(`Failed to send discovery to ${subnetBroadcast}:`, err);
+                logError(`Failed to send discovery to ${subnetBroadcast}:`, err);
             }
         }
     }
@@ -320,7 +321,7 @@ export class NetworkService extends events.EventEmitter {
                 existingPeer.hostname = msg.fromHostname;
             }
             if (wasOffline) {
-                console.log(`[${logTag}] Peer ${peerId} came back online`);
+                log(`[${logTag}] Peer ${peerId} came back online`);
             }
         } else {
             const peerInfo: PeerInfo = {
@@ -334,7 +335,7 @@ export class NetworkService extends events.EventEmitter {
                 status: 'online'
             };
             this._peers.set(peerId, peerInfo);
-            console.log(`[${logTag}] New peer found: ${peerId}`);
+            log(`[${logTag}] New peer found: ${peerId}`);
         }
 
         this.emit('peersUpdate', Array.from(this._peers.values()));
@@ -392,7 +393,7 @@ export class NetworkService extends events.EventEmitter {
         this._peers.forEach((peer, peerId) => {
             if (peer.status === 'online' && (now - peer.lastSeen > HEARTBEAT_TIMEOUT)) {
                 peer.status = 'offline';
-                console.log(`[Heartbeat] Peer ${peerId} timed out, marked offline`);
+                log(`[Heartbeat] Peer ${peerId} timed out, marked offline`);
                 changed = true;
             }
         });
@@ -443,12 +444,12 @@ export class NetworkService extends events.EventEmitter {
                 msg.from = peerId;
                 this.emit('message', msg);
             } catch (err) {
-                console.error('Failed to parse KCP message:', err);
+                logError('Failed to parse KCP message:', err);
             }
         });
 
         this._transport.on('sessionConnected', (peerId: string) => {
-            console.log(`KCP session connected: ${peerId}`);
+            log(`KCP session connected: ${peerId}`);
             const peer = this._peers.get(peerId);
             if (peer) {
                 peer.lastSeen = Date.now();
@@ -460,11 +461,11 @@ export class NetworkService extends events.EventEmitter {
         });
 
         this._transport.on('sessionClosed', (peerId: string) => {
-            console.log(`KCP session closed: ${peerId}`);
+            log(`KCP session closed: ${peerId}`);
         });
 
         this._transport.on('sessionError', (peerId: string, err: Error) => {
-            console.error(`KCP session error (${peerId}):`, err.message);
+            logError(`KCP session error (${peerId}):`, err.message);
         });
     }
 
@@ -485,11 +486,11 @@ export class NetworkService extends events.EventEmitter {
                         status: 'offline'
                     });
                 });
-                console.log(`Loaded ${peersArray.length} peers from ${filePath}`);
+                log(`Loaded ${peersArray.length} peers from ${filePath}`);
                 this.emit('peersUpdate', Array.from(this._peers.values()));
             }
         } catch (err) {
-            console.error('Failed to load peers from file:', err);
+            logError('Failed to load peers from file:', err);
         }
     }
 
@@ -567,7 +568,7 @@ export class NetworkService extends events.EventEmitter {
                     break;
             }
         } catch (err) {
-            console.error('Failed to parse UDP message:', err);
+            logError('Failed to parse UDP message:', err);
         }
     }
 

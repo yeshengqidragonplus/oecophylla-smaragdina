@@ -4,12 +4,22 @@ import { SettingsPanel } from './settingsPanel';
 import { PeersManager } from './peersManager';
 import { networkService } from './networkService';
 import { PeersEditor } from './peersEditor';
+import { setLogSink, log } from './logger';
 
 let chatProvider: ChatViewProvider;
 let peersManager: PeersManager;
 
 export function activate(context: vscode.ExtensionContext) {
-    console.log('Congratulations, your extension "Oecophylla smaragdina" is now active!');
+    // 日志通道：网络层与发送链路日志统一汇集于此，便于排查
+    const logChannel = vscode.window.createOutputChannel('OSChat 日志');
+    context.subscriptions.push(logChannel);
+    setLogSink(logChannel);
+    context.subscriptions.push(
+        vscode.commands.registerCommand('myChat.showLogs', () => {
+            logChannel.show(true);
+        })
+    );
+    log(`OSChat 激活，插件版本 ${context.extension.packageJSON.version}，传输层 UDP+KCP`);
 
     // 初始化 PeersManager
     peersManager = new PeersManager(context);

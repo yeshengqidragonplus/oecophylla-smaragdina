@@ -2,6 +2,7 @@ import * as vscode from 'vscode';
 import * as fs from 'fs';
 import * as path from 'path';
 import { PeersManager, StoredPeerInfo } from './peersManager';
+import { log, logError } from './logger';
 import { networkService, NetworkMessage, TransferTask } from './networkService';
 
 interface ChatMessage {
@@ -155,6 +156,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         webview.onDidReceiveMessage(async (message) => {
             switch (message.type) {
                 case 'sendMessage':
+                    log(`[发送] 收到 webview 发送请求: target=${message.targetPeer ?? '(未选择)'}, 内容长度=${(message.content ?? '').length}, 附件=${message.attachment?.name ?? '无'}`);
                     await this._handleSendMessage(message.content, message.attachment, message.targetPeer);
                     break;
                 case 'loadSession':
@@ -610,6 +612,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         targetPeer?: string
     ): Promise<void> {
         if (!content.trim() && this._selectedFiles.size === 0) {
+            log('[发送] 忽略：内容为空且无附件');
             return;
         }
 
@@ -621,6 +624,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 
         // 必须选择目标
         if (!targetPeer) {
+            log('[发送] 中止：未选择发送目标');
             this._addSystemMessage('❌ 请先选择发送目标');
             this._updateWebviewContent();
             return;
@@ -628,6 +632,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 
         const peer = this._peersManager.getPeerById(targetPeer);
         if (!peer) {
+            log(`[发送] 中止：peers 列表中找不到 ${targetPeer}`);
             this._addSystemMessage(`❌ 未找到目标用户: ${targetPeer}`);
             this._updateWebviewContent();
             return;
@@ -681,8 +686,10 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
             this._updateWebviewContent();
 
             // 执行传输
+            log(`[发送] 开始执行传输任务 ${task.id} → ${targetPeer}（消息 ${messages.length} 条 / 文件 ${files.length} 个）`);
             await networkService.executeTransferTask(task.id);
-            
+
+            log(`[发送] 传输任务 ${task.id} 完成`);
             this._addSystemMessage(`✅ 已成功发送给 ${displayName}`);
             
             // 更新会话状态为完成
@@ -695,8 +702,9 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
             
         } catch (error) {
             const errorMessage = (error as Error).message;
-            
-            if (errorMessage.includes('Connect timeout')) {
+            logError(`[发送] 失败: ${errorMessage}`);
+
+            if (errorMessage.includes('Connect timeout') || errorMessage.includes('超时')) {
                 this._addSystemMessage(`❌ 连接超时: ${displayName} 可能不在线`);
                 
                 // 更新会话状态为失败
