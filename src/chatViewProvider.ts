@@ -1533,6 +1533,10 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
             }
         });
 
+        document.getElementById('sendBtn').addEventListener('click', function() {
+            sendMessage();
+        });
+
         function sendMessage() {
             const content = messageInput.value.trim();
             if (!content && selectedFiles.length === 0) return;
