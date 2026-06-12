@@ -11,7 +11,12 @@
   ],
   "activationEvents": [
     "onView:OSChatView",
-    "onCommand:myChat.openSettings"
+    "onCommand:myChat.openSettings",
+    "onCommand:myChat.newChat",
+    "onCommand:myChat.startNetwork",
+    "onCommand:myChat.stopNetwork",
+    "onCommand:myChat.editPeers",
+    "onCommand:myChat.openPeersFile"
   ],
   "main": "./dist/extension.js",
   "contributes": {
