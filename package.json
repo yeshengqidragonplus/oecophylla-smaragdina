@@ -3,6 +3,7 @@
   "displayName": "Oecophylla smaragdina",
   "description": "一个用于小型内网简单通信的 VS Code 插件",
   "version": "0.0.1",
+  "repository": "https://github.com/example/example",
   "engines": {
     "vscode": "^1.92.0"
   },
