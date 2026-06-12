@@ -182,9 +182,13 @@ export class KcpTransport extends events.EventEmitter {
             this._sessions.set(peerId, session);
             this._convIndex.set(conv, session);
 
+            log(`[KCP] 发起握手 → ${peerId}（${host}:${port}，conv=${conv}）`);
             const syn: ControlMessage = { t: 'syn', conv, id: this._localId };
             this._sendControl(host, port, syn);
+            let synCount = 1;
             const retryTimer = setInterval(() => {
+                synCount++;
+                log(`[KCP] SYN 重发第 ${synCount} 次 → ${peerId}（未收到 ACK）`);
                 this._sendControl(host, port, syn);
             }, SYN_RETRY_INTERVAL);
 
@@ -202,6 +206,7 @@ export class KcpTransport extends events.EventEmitter {
                     this._sessions.delete(peerId);
                 }
                 this._convIndex.delete(conv);
+                logError(`[KCP] 握手超时（${timeoutMs}ms）: ${peerId} 未应答——对方离线、未升级到 KCP 版本或 UDP 端口被防火墙拦截`);
                 reject(new Error(`连接 ${peerId} 超时`));
             }, timeoutMs);
 
@@ -259,6 +264,7 @@ export class KcpTransport extends events.EventEmitter {
                 lastWait = wait;
                 stallSince = now;
             } else if (now - stallSince > ACK_STALL_TIMEOUT) {
+                logError(`[KCP] 发送确认停滞 ${ACK_STALL_TIMEOUT}ms（剩余未确认段 ${wait}），判定 ${peerId} 离线，销毁会话`);
                 this._destroySession(session, true);
                 throw new Error(`发送至 ${peerId} 确认超时（对端可能已离线）`);
             }
@@ -338,8 +344,10 @@ export class KcpTransport extends events.EventEmitter {
             // 双向同时建连：发起方 peerId 字典序较小者胜出
             if (existing.initiator <= peerId) {
                 // 已有会话胜出（含本端先发起且本端 id 较小的情况），忽略对方的 SYN
+                log(`[KCP] 双向建连仲裁：保留已有会话（发起方 ${existing.initiator}），忽略 ${peerId} 的 SYN`);
                 return;
             }
+            log(`[KCP] 双向建连仲裁：${peerId} 发起的会话胜出，替换已有会话（发起方 ${existing.initiator}）`);
             this._destroySession(existing, false);
         }
 
@@ -374,6 +382,7 @@ export class KcpTransport extends events.EventEmitter {
         }
         const session = this._convIndex.get(ctrl.conv >>> 0);
         if (session) {
+            log(`[KCP] 收到 ${session.peerId} 的 FIN，关闭会话`);
             this._destroySession(session, true);
         }
     }
@@ -477,6 +486,7 @@ export class KcpTransport extends events.EventEmitter {
             if (session.established &&
                 session.kcp.waitSnd() === 0 &&
                 now - session.lastActive > SESSION_IDLE_TIMEOUT) {
+                log(`[KCP] 会话 ${session.peerId} 空闲超过 ${SESSION_IDLE_TIMEOUT / 60000} 分钟，回收`);
                 this._sendControl(session.ip, session.port, { t: 'fin', conv: session.conv });
                 this._destroySession(session, true);
             }

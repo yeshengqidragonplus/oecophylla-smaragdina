@@ -599,6 +599,7 @@ export class NetworkService extends events.EventEmitter {
             status: 'offline'
         };
         this._peers.set(peerId, peer);
+        log(`[Peer] ${peerId} 不在运行时列表，按约定补建（KCP 端口 ${peer.transferPort}）`);
         this.emit('peersUpdate', Array.from(this._peers.values()));
         return peer;
     }
@@ -612,9 +613,12 @@ export class NetworkService extends events.EventEmitter {
             throw new Error('传输层未启动');
         }
         if (this._transport.hasSession(peerId)) {
+            log(`[会话] 复用已有 KCP 会话: ${peerId}`);
             return;
         }
+        log(`[会话] 向 ${peer.ip}:${peer.transferPort}（UDP/KCP）发起握手，超时 ${CONNECT_TIMEOUT}ms ...`);
         await this._transport.connect(peerId, peer.ip, peer.transferPort, CONNECT_TIMEOUT);
+        log(`[会话] 与 ${peerId} 的 KCP 会话已建立`);
     }
 
     /**
@@ -665,12 +669,14 @@ export class NetworkService extends events.EventEmitter {
             throw new Error(`Transfer task ${taskId} not found`);
         }
 
+        log(`[传输] 任务 ${taskId} 开始：目标 ${task.peerId}，消息 ${task.messages.length} 条，文件 ${task.files.length} 个（共 ${task.totalBytes} 字节）`);
         task.status = 'connecting';
         this.emit('transferTaskUpdated', task);
 
         try {
             await this._ensureSession(task.peerId);
         } catch (err) {
+            logError(`[传输] 任务 ${taskId} 建连失败: ${(err as Error).message}`);
             task.status = 'timeout';
             task.errorMessage = '连接失败，对方可能不在线';
             this.emit('transferTaskUpdated', task);
@@ -691,10 +697,13 @@ export class NetworkService extends events.EventEmitter {
                     timestamp: Date.now()
                 };
                 await this._sendViaTransport(task.peerId, msg);
+                log(`[传输] 文本消息已送达 ${task.peerId}（${message.length} 字）`);
             }
 
             for (const file of task.files) {
+                log(`[传输] 开始发送文件 ${file.name}（${file.size} 字节）→ ${task.peerId}`);
                 await this._sendFileChunked(task, file);
+                log(`[传输] 文件 ${file.name} 发送完成`);
             }
 
             task.status = 'completed';
@@ -703,6 +712,7 @@ export class NetworkService extends events.EventEmitter {
             this.emit('transferTaskUpdated', task);
             this.emit('transferTaskCompleted', task);
         } catch (err) {
+            logError(`[传输] 任务 ${taskId} 失败: ${(err as Error).message}`);
             task.status = 'failed';
             task.errorMessage = (err as Error).message;
             this.emit('transferTaskUpdated', task);

@@ -155,6 +155,9 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     private _setupMessageHandlers(webview: vscode.Webview): void {
         webview.onDidReceiveMessage(async (message) => {
             switch (message.type) {
+                case 'webviewLog':
+                    log(`[界面] ${message.text}`);
+                    break;
                 case 'sendMessage':
                     log(`[发送] 收到 webview 发送请求: target=${message.targetPeer ?? '(未选择)'}, 内容长度=${(message.content ?? '').length}, 附件=${message.attachment?.name ?? '无'}`);
                     await this._handleSendMessage(message.content, message.attachment, message.targetPeer);
@@ -1541,13 +1544,24 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
             }
         });
 
+        // 界面日志转发到扩展（"OSChat 日志"输出通道），便于排查界面层问题
+        function dbg(text) {
+            try { vscode.postMessage({ type: 'webviewLog', text: text }); } catch (e) { /* ignore */ }
+        }
+        dbg('webview 脚本已加载');
+
         document.getElementById('sendBtn').addEventListener('click', function() {
+            dbg('点击发送按钮');
             sendMessage();
         });
 
         function sendMessage() {
             const content = messageInput.value.trim();
-            if (!content && selectedFiles.length === 0) return;
+            dbg('sendMessage(): 目标=' + (selectedPeer || '(未选择)') + ', 内容长度=' + content.length + ', 附件数=' + selectedFiles.length);
+            if (!content && selectedFiles.length === 0) {
+                dbg('sendMessage(): 内容为空且无附件，忽略');
+                return;
+            }
 
             for (const file of selectedFiles) {
                 vscode.postMessage({
@@ -1721,7 +1735,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
                     console.log('[DEBUG] found peer:', peer);
                     
                     if (peer) {
-                        console.log('[DEBUG] setting selectedPeer to:', clickedPeerId);
+                        dbg('选择发送目标: ' + clickedPeerId);
                         selectedPeer = clickedPeerId;
                         targetSelectorText.textContent = peer.displayName;
                         console.log('[DEBUG] targetSelectorText updated to:', targetSelectorText.textContent);
