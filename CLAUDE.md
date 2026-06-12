@@ -25,9 +25,9 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 - **UDP 通道**（`src/networkService.ts` + dgram）：仅用于发现与状态。
   - 主 socket（`oschat.port`，默认 8080）：收发心跳（heartbeat/heartbeat_ack，维护在线/离线）、接收发现应答；peerId 即 `ip:主端口`。
   - 共享发现 socket（固定端口 41320，reuseAddr）：所有实例共同绑定，接收广播 discovery_request——这样同一台机器上主端口不同的多个实例也能互相发现；应答单播回请求方主端口。
-- **TCP 业务通道**（主端口 + 1000，`src/tcpTransport.ts`，Node 内置 net）：所有业务消息走这里——聊天消息和文件传输（64KB 分块流式读取、真实进度）。帧格式为 4 字节大端长度前缀 + JSON；连接建立后第一帧必须是身份帧 `{"__id": "<peerId>"}`，对端据此把 socket 映射到 peerId。双向同时建连时由 peerId 字典序小的一方的出站连接胜出。TCP 端口通过 UDP 消息的 `transferPort` 字段告知对端。发送前不做额外握手——TCP 建连（5 秒超时）本身就是在线检测。
+- **KCP 业务通道**（专用 UDP 端口 = 主端口 + 1000，`src/kcpTransport.ts` + `src/kcp.ts`）：所有业务消息走这里——聊天消息和文件传输（64KB 分块流式读取、真实进度）。`src/kcp.ts` 是 ikcp.c 的纯 TypeScript 移植（ARQ，无 FEC，零原生依赖）。会话由 SYN/ACK 控制报文握手建立（数据报首字节 0x01 控制/0x02 KCP），握手自带身份（peerId）；双向同时建连时由发起方 peerId 字典序小的会话胜出。KCP 可靠流之上保留 4 字节大端长度前缀 + JSON 帧。KCP 端口通过 UDP 消息的 `transferPort` 字段告知对端。握手（5 秒超时）即在线检测；send 等待对端 KCP 确认，确认无进展 5 秒判定离线快速失败。
 
-`networkService` 是模块级单例（`export const networkService`），是一个 EventEmitter；TcpTransport 由它创建并持有。所有线上消息共用 `NetworkMessage` 接口（`type` 字段区分）。
+`networkService` 是模块级单例（`export const networkService`），是一个 EventEmitter；KcpTransport 由它创建并持有。所有线上消息共用 `NetworkMessage` 接口（`type` 字段区分）。
 
 端到端验证：`npm run compile-tests` 后 `node smoke-test.js`（同机起两个实例互发消息/文件，不依赖 VS Code）。
 
@@ -44,7 +44,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 - TypeScript strict 模式；ES2022 目标，Node16 模块
 - ESLint 规则（warn 级别）：必须分号、必须大括号（curly）、相等比较用 `===`
-- 注意传输层资源管理：重建 TcpTransport 前先 `removeAllListeners()` + `stop()`（历史上有事件监听泄漏 bug）
+- 注意传输层资源管理：重建 KcpTransport 前先 `removeAllListeners()` + `stop()`（历史上有事件监听泄漏 bug）
 - 接收文件名必须经过 `path.basename` + 非法字符过滤（防路径穿越），同名文件加序号不覆盖
 
 ## Encoding
