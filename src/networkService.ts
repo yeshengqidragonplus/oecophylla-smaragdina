@@ -572,13 +572,41 @@ export class NetworkService extends events.EventEmitter {
     }
 
     /**
+     * 解析 peerId 对应的 PeerInfo。
+     * 若不在已知列表（如启动后才在 peers 编辑器中新增的对象），
+     * 则按 peerId 的 `ip:端口` 约定即时补建一条记录——
+     * TCP 建连（5 秒超时）本身就是在线检测，无需等发现/心跳。
+     */
+    private _resolvePeer(peerId: string): PeerInfo {
+        const existing = this._peers.get(peerId);
+        if (existing) {
+            return existing;
+        }
+        const sepIndex = peerId.lastIndexOf(':');
+        const ip = sepIndex > 0 ? peerId.slice(0, sepIndex) : '';
+        const port = sepIndex > 0 ? parseInt(peerId.slice(sepIndex + 1), 10) : NaN;
+        if (!ip || !Number.isInteger(port) || port <= 0 || port > 65535) {
+            throw new Error(`Peer ${peerId} not found`);
+        }
+        const peer: PeerInfo = {
+            id: peerId,
+            hostname: '',
+            ip,
+            port,
+            transferPort: port + 1000,
+            lastSeen: Date.now(),
+            status: 'offline'
+        };
+        this._peers.set(peerId, peer);
+        this.emit('peersUpdate', Array.from(this._peers.values()));
+        return peer;
+    }
+
+    /**
      * 确保与指定 peer 建立了 TCP 会话
      */
     private async _ensureSession(peerId: string): Promise<void> {
-        const peer = this._peers.get(peerId);
-        if (!peer) {
-            throw new Error(`Peer ${peerId} not found`);
-        }
+        const peer = this._resolvePeer(peerId);
         if (!this._transport) {
             throw new Error('传输层未启动');
         }
@@ -602,10 +630,7 @@ export class NetworkService extends events.EventEmitter {
         messages: string[],
         files: { name: string; path: string; size: number }[]
     ): TransferTask {
-        const peer = this._peers.get(peerId);
-        if (!peer) {
-            throw new Error(`Peer ${peerId} not found`);
-        }
+        const peer = this._resolvePeer(peerId);
 
         const totalBytes = files.reduce((sum, f) => sum + f.size, 0);
         const taskId = `transfer_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
@@ -744,11 +769,6 @@ export class NetworkService extends events.EventEmitter {
      * 发送消息到指定 peer（通过 TCP 可靠传输）
      */
     public async sendToPeer(peerId: string, message: NetworkMessage): Promise<void> {
-        const peer = this._peers.get(peerId);
-        if (!peer) {
-            console.error(`Peer ${peerId} not found`);
-            return;
-        }
         await this._sendViaTransport(peerId, message);
     }
 
