@@ -5,6 +5,7 @@ import { PeersManager } from './peersManager';
 import { networkService } from './networkService';
 import { PeersEditor } from './peersEditor';
 import { setLogSink, log } from './logger';
+import { getBuildHash } from './buildInfo';
 
 let chatProvider: ChatViewProvider;
 let peersManager: PeersManager;
@@ -19,7 +20,7 @@ export function activate(context: vscode.ExtensionContext) {
             logChannel.show(true);
         })
     );
-    log(`OSChat 激活，插件版本 ${context.extension.packageJSON.version}，传输层 UDP+KCP`);
+    log(`OSChat 激活，插件版本 ${context.extension.packageJSON.version}，构建 ${getBuildHash()}，传输层 UDP+KCP`);
 
     // 初始化 PeersManager
     peersManager = new PeersManager(context);

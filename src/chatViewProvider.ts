@@ -3,6 +3,7 @@ import * as fs from 'fs';
 import * as path from 'path';
 import { PeersManager, StoredPeerInfo } from './peersManager';
 import { log, logError } from './logger';
+import { getBuildHash } from './buildInfo';
 import { networkService, NetworkMessage, TransferTask } from './networkService';
 
 interface ChatMessage {
@@ -902,6 +903,17 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
             cursor: pointer;
             font-size: 11px;
         }
+
+        .build-badge {
+            margin-left: auto;
+            margin-right: 8px;
+            font-size: 10px;
+            font-weight: normal;
+            font-family: var(--vscode-editor-font-family, monospace);
+            color: var(--vscode-descriptionForeground);
+            opacity: 0.7;
+            user-select: all;
+        }
         
         .recent-item {
             padding: 8px 10px;
@@ -1387,6 +1399,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     <div class="recent-section" id="recentSection" style="order: -1;">
         <div class="recent-title">
             <span>最近对话</span>
+            <span class="build-badge" title="构建指纹（MD5 前 8 位）：两端一致即为同一个构建">构建 ${getBuildHash()}</span>
             <button class="view-all-btn" id="viewAllBtn">查看全部</button>
         </div>
         <div id="recentList"></div>
