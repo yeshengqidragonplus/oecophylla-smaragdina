@@ -38,3 +38,11 @@ This file provides guidance to agents when working with code in this repository.
 - TypeScript 5.x (Node16 模块，ES2022 目标)
 - esbuild 打包
 - mocha + @vscode/test-cli 测试框架
+
+## Git tooling
+
+- Git Commit Message Info,wirte like this:AI(AI模型简称)-提交内容分类：具体内容概括，多内容时可以一句概述然后具体事项换行，1，2，3，4，...这样列出。
+- Commit but never push.
+- 按功能颗粒度细一点提交，以后有问题直接revert整个Commit比较方便。
+- 每次提交只包含这次功能修改相关内容，不是你改的不要提交。
+- AI模型简称：DS4(deepseek v4)、GLM(glm)、MM(MiniMax)、DB(doubao)
