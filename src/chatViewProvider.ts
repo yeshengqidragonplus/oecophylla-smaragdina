@@ -458,15 +458,19 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 
     private _assembleAndSaveFile(transferKey: string, transfer: IncomingFileTransfer): void {
         try {
-            // 按顺序组装所有块
-            let fileData = '';
+            // 按顺序组装所有块：逐块 base64 解码为 Buffer 后再拼接。
+            // 注意：不能把多块 base64 字符串拼接后再一次性解码——
+            // 每块 base64 末尾的 '=' padding 会让解码器提前终止，
+            // 导致第一块之后的数据全部丢失（图片表现为全黑）。
+            const buffers: Buffer[] = [];
             for (let i = 0; i < transfer.totalChunks; i++) {
                 const chunk = transfer.chunks.get(i);
                 if (chunk === undefined) {
                     throw new Error(`缺少文件块 ${i + 1}/${transfer.totalChunks}`);
                 }
-                fileData += chunk;
+                buffers.push(Buffer.from(chunk, 'base64'));
             }
+            const buffer = Buffer.concat(buffers);
 
             // 确定保存路径
             const downloadPath = this._getDownloadPath(transfer.fileName);
@@ -475,8 +479,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
                 fs.mkdirSync(dir, { recursive: true });
             }
 
-            // 写入文件（base64 解码）
-            const buffer = Buffer.from(fileData, 'base64');
+            // 写入文件
             fs.writeFileSync(downloadPath, buffer);
 
             // 清理传输记录
