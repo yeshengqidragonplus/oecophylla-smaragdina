@@ -6,6 +6,7 @@ import { networkService } from './core/networkService';
 import { PeersEditor } from './peersEditor';
 import { initNetworkIdentity, startNetworkFromConfig, stopNetwork } from './networkLauncher';
 import { scanSubnet, showDiagnostics } from './diagnose';
+import { registerStatusUi } from './statusBar';
 import { setLogSink, log } from './core/logger';
 import { getBuildHash } from './core/buildInfo';
 
@@ -51,6 +52,9 @@ export function activate(context: vscode.ExtensionContext) {
             }
         })
     );
+
+    // 状态栏与标题栏的启动/停止切换（先于自动启动注册，才能收到启动状态）
+    registerStatusUi(context);
 
     // 自动启动网络服务（读取最新配置，不阻塞激活）
     if (vscode.workspace.getConfiguration('oschat').get<boolean>('autoConnect', true)) {

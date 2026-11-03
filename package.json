@@ -119,7 +119,12 @@
         },
         {
           "command": "myChat.startNetwork",
-          "when": "view == OSChatView",
+          "when": "view == OSChatView && !oschat.running",
+          "group": "navigation"
+        },
+        {
+          "command": "myChat.stopNetwork",
+          "when": "view == OSChatView && oschat.running",
           "group": "navigation"
         },
         {

@@ -4,7 +4,7 @@ import * as path from 'path';
 import { PeersManager } from './peersManager';
 import { log, logError } from './core/logger';
 import { getBuildHash } from './core/buildInfo';
-import { networkService, NetworkMessage, TransferTask } from './core/networkService';
+import { networkService, NetworkMessage, NetworkStatus, TransferTask } from './core/networkService';
 import { startNetworkFromConfig, stopNetwork } from './networkLauncher';
 
 interface ChatMessage {
@@ -51,6 +51,9 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     private _sessions: ChatSession[] = [];
     private _currentSessionId: string | null = null;
     private _lastSelectedPeerId: string | null = null;
+    /** 侧边栏不可见期间收到的未读条数（显示为活动栏徽标） */
+    private _unread: number = 0;
+    private _lastToastAt: number = 0;
     private _context: vscode.ExtensionContext;
     private _peersManager: PeersManager;
     private _selectedFiles: Map<string, { name: string; path: string; size: number }> = new Map();
@@ -97,6 +100,11 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
             this._activeTransferTasks.set(task.id, task);
             this._updateTransferProgress(task);
         });
+
+        // 网络服务状态变化（含命令面板启动、自动启动、启动失败）都同步给界面
+        networkService.on('statusChange', (status: NetworkStatus) => {
+            this._postNetworkStatus(status.state === 'running');
+        });
     }
 
     public resolveWebviewView(
@@ -105,6 +113,13 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         _token: vscode.CancellationToken
     ): void {
         this._view = webviewView;
+
+        // 用户看到侧边栏就算已读：清除徽标
+        webviewView.onDidChangeVisibility(() => {
+            if (webviewView.visible) {
+                this._clearUnread();
+            }
+        });
 
         webviewView.webview.options = {
             enableScripts: true,
@@ -322,6 +337,44 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         const session = this._getOrCreateSessionForPeer(msg.from, displayName);
         this._appendMessageToSession(session, incomingMessage);
         this._updateWebviewContent();
+        this._notifyIncoming(displayName, (msg.content || '').replace(/\s+/g, ' ').slice(0, 60));
+    }
+
+    /**
+     * 收到消息时的提醒：侧边栏不可见才提醒（用户正看着就不打扰），
+     * 活动栏图标显示未读徽标；通知最多每 5 秒一条，避免连发消息时刷屏
+     */
+    private _notifyIncoming(displayName: string, preview: string): void {
+        if (this._view?.visible) {
+            return;
+        }
+        this._unread++;
+        this._updateBadge();
+
+        const now = Date.now();
+        if (now - this._lastToastAt < 5000) {
+            return;
+        }
+        this._lastToastAt = now;
+        const open = '查看';
+        void vscode.window.showInformationMessage(`${displayName}：${preview}`, open).then(pick => {
+            if (pick === open) {
+                void vscode.commands.executeCommand('workbench.view.extension.OSChatContainer');
+            }
+        });
+    }
+
+    private _updateBadge(): void {
+        if (this._view) {
+            this._view.badge = this._unread > 0
+                ? { value: this._unread, tooltip: `${this._unread} 条未读消息` }
+                : undefined;
+        }
+    }
+
+    private _clearUnread(): void {
+        this._unread = 0;
+        this._updateBadge();
     }
 
     /**
@@ -494,8 +547,12 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
                 });
             }
 
-            // 弹出通知
+            // 弹出通知，并计入未读（侧边栏不可见时）
             vscode.window.showInformationMessage(`已接收文件: ${transfer.fileName}`);
+            if (!this._view?.visible) {
+                this._unread++;
+                this._updateBadge();
+            }
 
         } catch (err) {
             const errorMsg = (err as Error).message;
@@ -633,11 +690,22 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 
         const displayName = this._peersManager.getPeerDisplayName(peer);
 
-        // 创建用户消息
+        // 收集选中的文件
+        const files: { name: string; path: string; size: number }[] = [];
+        this._selectedFiles.forEach(file => {
+            files.push({
+                name: file.name,
+                path: file.path,
+                size: file.size
+            });
+        });
+
+        // 创建用户消息：文字之外，把发送的文件也列在气泡里（只发文件时不再是空气泡）
+        const fileLines = files.map(f => `📎 ${f.name}（${this._formatFileSize(f.size)}）`);
         const userMessage: ChatMessage = {
             id: Date.now().toString(),
             type: 'user',
-            content: content,
+            content: [content.trim(), ...fileLines].filter(Boolean).join('\n'),
             timestamp: Date.now(),
             targetPeer: targetPeer
         };
@@ -646,16 +714,6 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 
         // 准备发送内容
         const messages: string[] = content.trim() ? [content] : [];
-        const files: { name: string; path: string; size: number }[] = [];
-
-        // 添加选中的文件
-        this._selectedFiles.forEach(file => {
-            files.push({
-                name: file.name,
-                path: file.path,
-                size: file.size
-            });
-        });
 
         // 清空文件选择
         this._selectedFiles.clear();
@@ -1018,6 +1076,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
             padding: 10px 14px;
             border-radius: 12px;
             word-wrap: break-word;
+            white-space: pre-wrap;
             line-height: 1.5;
         }
         
@@ -1539,8 +1598,19 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
             console.log('[DEBUG] networkBtn not found!');
         }
 
+        // 输入法组合期间（如中文拼音选词）按 Enter 是确认候选字，不能当作发送。
+        // Chromium 里该 keydown 的 isComposing 为 true、keyCode 为 229；
+        // 部分输入法在 compositionend 之后才触发确认用的 keydown，所以再用标志位兜底一拍
+        let imeComposing = false;
+        messageInput.addEventListener('compositionstart', function() { imeComposing = true; });
+        messageInput.addEventListener('compositionend', function() {
+            setTimeout(function() { imeComposing = false; }, 0);
+        });
         messageInput.addEventListener('keydown', function(e) {
             if (e.key === 'Enter' && !e.shiftKey) {
+                if (e.isComposing || imeComposing || e.keyCode === 229) {
+                    return;
+                }
                 e.preventDefault();
                 sendMessage();
             }
