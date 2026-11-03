@@ -5,6 +5,15 @@ import * as fs from 'fs';
 import { KcpTransport } from './kcpTransport';
 import { log, logError } from './logger';
 import { classifyNetError, ErrorThrottle, NetErrorInfo } from './netErrors';
+import {
+    LanInterface,
+    RawInterfaces,
+    broadcastTargets,
+    interfaceFingerprint,
+    listLanInterfaces,
+    listLocalAddresses,
+    pickPrimary
+} from './netInterfaces';
 
 export interface PeerInfo {
     id: string;
@@ -59,7 +68,9 @@ const HEARTBEAT_TIMEOUT = 90_000;
 /** 心跳发送间隔（毫秒） */
 const HEARTBEAT_INTERVAL = 30_000;
 /** 广播发现间隔（毫秒） */
-const DISCOVERY_INTERVAL = 60_000;
+const DISCOVERY_INTERVAL = 30_000;
+/** 启动后的快速补发时机（毫秒）：对端可能刚好还没绑定发现端口，不必干等一个完整周期 */
+const DISCOVERY_QUICK_DELAYS = [1_000, 3_000];
 /**
  * 固定发现端口：所有实例额外用 reuseAddr 共享绑定此端口接收广播，
  * 这样同一台机器上主端口不同的多个实例也能互相发现。
@@ -83,9 +94,16 @@ export class NetworkService extends events.EventEmitter {
     private _transferTasks: Map<string, TransferTask> = new Map();
     private _transport: KcpTransport | null = null;
 
-    /** 本机所有 IPv4 地址（含回环），用于过滤自己发出的广播 */
+    /** 本机所有 IPv4 地址（含回环和被排除的网卡），用于过滤自己发出的广播 */
     private _localIps: Set<string> = new Set();
+    /** 主网卡地址（仅用于展示与旧版协议的身份兼容） */
     private _localIp: string = '127.0.0.1';
+    /** 可用的局域网网卡（已排除回环/TUN/链路本地，真实网卡排前），发现广播逐块发送 */
+    private _lanInterfaces: LanInterface[] = [];
+    private _ifaceFingerprint: string = '';
+    private _discoveryQuickTimers: NodeJS.Timeout[] = [];
+    /** 测试开关：关闭广播发现，用于验证单播探测不依赖广播 */
+    private _broadcastEnabled: boolean = true;
 
     private _heartbeatIntervalTimer: NodeJS.Timeout | null = null;
     private _discoveryIntervalTimer: NodeJS.Timeout | null = null;
@@ -111,7 +129,7 @@ export class NetworkService extends events.EventEmitter {
 
         this._port = port;
         this._nickname = nickname;
-        this._refreshLocalIps();
+        this._refreshNetwork();
 
         if (peersFilePath) {
             this._loadPeersFromFile(peersFilePath);
@@ -146,8 +164,10 @@ export class NetworkService extends events.EventEmitter {
 
         this._isRunning = true;
 
-        // 启动后立即发送一次广播发现
+        // 启动后立即发送一次广播发现，并在随后几秒内快速补发
         this._sendDiscoveryBroadcast();
+        this._discoveryQuickTimers = DISCOVERY_QUICK_DELAYS.map(delay =>
+            setTimeout(() => this._sendDiscoveryBroadcast(), delay));
 
         this._discoveryIntervalTimer = setInterval(() => {
             this._sendDiscoveryBroadcast();
@@ -223,12 +243,15 @@ export class NetworkService extends events.EventEmitter {
     // ==================== 广播自动发现 ====================
 
     /**
-     * 发送 UDP 广播发现请求
+     * 发送 UDP 广播发现请求：向每块可用网卡的定向广播地址各发一份，再加受限广播。
+     * 每轮先刷新网卡信息——网络切换（开关 VPN/TUN、换 Wi-Fi）后本机地址集合会变化。
      */
     private _sendDiscoveryBroadcast(): void {
-        if (!this._udpServer) {
+        if (!this._udpServer || !this._broadcastEnabled) {
             return;
         }
+
+        this._refreshNetwork();
 
         const message: NetworkMessage = {
             type: 'discovery_request',
@@ -238,43 +261,12 @@ export class NetworkService extends events.EventEmitter {
             timestamp: Date.now(),
             transferPort: this._transport?.port || (this._port + 1000)
         };
-
         const buffer = Buffer.from(JSON.stringify(message));
 
         // 从主 socket 发出（源端口 = 主端口，对方据此回复），目标为共享发现端口
-        this._udpSend(buffer, DISCOVERY_PORT, '255.255.255.255', 'discovery');
-
-        // 也向子网广播地址发送
-        const subnetBroadcast = this._getSubnetBroadcast();
-        if (subnetBroadcast) {
-            this._udpSend(buffer, DISCOVERY_PORT, subnetBroadcast, 'discovery');
+        for (const target of broadcastTargets(this._lanInterfaces)) {
+            this._udpSend(buffer, DISCOVERY_PORT, target, 'discovery');
         }
-    }
-
-    /**
-     * 获取子网广播地址（如 192.168.1.255）
-     */
-    private _getSubnetBroadcast(): string | null {
-        const interfaces = os.networkInterfaces();
-        for (const name of Object.keys(interfaces)) {
-            const iface = interfaces[name];
-            if (!iface) { continue; }
-            for (const addr of iface) {
-                if (addr.family === 'IPv4' && !addr.internal) {
-                    const parts = addr.address.split('.');
-                    const netmask = addr.netmask || '255.255.255.0';
-                    const maskParts = netmask.split('.');
-                    const broadcast = parts.map((part, i) => {
-                        if (maskParts[i] === '255') {
-                            return part;
-                        }
-                        return '255';
-                    }).join('.');
-                    return broadcast;
-                }
-            }
-        }
-        return null;
     }
 
     /**
@@ -510,6 +502,8 @@ export class NetworkService extends events.EventEmitter {
             clearInterval(this._discoveryIntervalTimer);
             this._discoveryIntervalTimer = null;
         }
+        this._discoveryQuickTimers.forEach(timer => clearTimeout(timer));
+        this._discoveryQuickTimers = [];
 
         if (this._transport) {
             this._transport.removeAllListeners();
@@ -851,32 +845,45 @@ export class NetworkService extends events.EventEmitter {
     }
 
     /**
-     * 刷新本机 IP 缓存
+     * 刷新网卡信息：本机地址集合、可用局域网网卡、主网卡地址。
+     * @returns 网卡集合是否发生变化
      */
-    private _refreshLocalIps(): void {
-        this._localIps = new Set(['127.0.0.1']);
-        this._localIp = '127.0.0.1';
+    private _refreshNetwork(): boolean {
+        const raw = os.networkInterfaces() as RawInterfaces;
+        const lan = listLanInterfaces(raw);
+        const fingerprint = interfaceFingerprint(lan);
+        const changed = fingerprint !== this._ifaceFingerprint;
 
-        const interfaces = os.networkInterfaces();
-        for (const name of Object.keys(interfaces)) {
-            const iface = interfaces[name];
-            if (!iface) { continue; }
-            for (const addr of iface) {
-                if (addr.family === 'IPv4') {
-                    this._localIps.add(addr.address);
-                    if (!addr.internal && this._localIp === '127.0.0.1') {
-                        this._localIp = addr.address;
-                    }
-                }
-            }
+        this._localIps = listLocalAddresses(raw);
+        this._lanInterfaces = lan;
+        this._ifaceFingerprint = fingerprint;
+
+        const primary = pickPrimary(lan)?.address ?? '127.0.0.1';
+        if (primary !== this._localIp) {
+            this._localIp = primary;
+            // 旧版协议用 ip:端口 作身份，主网卡变了要同步给传输层
+            this._transport?.setLocalId(this._localPeerId());
         }
+
+        if (changed) {
+            const desc = lan.length === 0
+                ? '无可用局域网网卡'
+                : lan.map(i => `${i.name} ${i.address}/${i.prefix}（广播 ${i.broadcast}${i.virtual ? '，疑似虚拟网卡' : ''}）`).join('；');
+            log(`[网卡] 可用网卡：${desc}`);
+        }
+        return changed;
     }
 
     public getLocalIp(): string {
-        if (this._localIp === '127.0.0.1' && this._localIps.size <= 1) {
-            this._refreshLocalIps();
+        if (this._lanInterfaces.length === 0 && this._localIp === '127.0.0.1') {
+            this._refreshNetwork();
         }
         return this._localIp;
+    }
+
+    /** 当前可用的局域网网卡（供诊断展示） */
+    public getLanInterfaces(): LanInterface[] {
+        return this._lanInterfaces;
     }
 }
 
