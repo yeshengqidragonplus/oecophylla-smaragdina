@@ -1,0 +1,4 @@
+# 统一用 LF，避免 Windows 检出（core.autocrlf）把源码转成 CRLF
+* text=auto eol=lf
+*.vsix binary
+*.svg text

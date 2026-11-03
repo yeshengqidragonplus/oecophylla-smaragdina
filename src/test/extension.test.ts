@@ -1,19 +1,19 @@
 import * as assert from 'assert';
+import * as os from 'os';
+import * as path from 'path';
 import * as vscode from 'vscode';
-import { PeersManager, StoredPeerInfo } from '../peersManager';
+import { PeersManager } from '../peersManager';
 import { NetworkService, PeerInfo, NetworkMessage, TransferTask } from '../networkService';
 
 suite('Extension Test Suite', () => {
     vscode.window.showInformationMessage('Start all tests.');
 
-    let mockContext: vscode.ExtensionContext;
-
     suiteSetup(async () => {
-        // 获取扩展实例以使用其 context
-        const ext = vscode.extensions.getExtension('oecophylla-smaragdina');
-        if (ext) {
-            await ext.activate();
-        }
+        // 按 package.json 的 name 查找扩展（未设置 publisher 时扩展 id 是 undefined_publisher.xxx，
+        // 直接写 id 会查不到）；找不到必须让测试失败，而不是静默跳过激活
+        const ext = vscode.extensions.all.find(e => e.packageJSON.name === 'oecophylla-smaragdina');
+        assert.ok(ext, '找不到 oecophylla-smaragdina 扩展，请检查测试宿主是否加载了本扩展');
+        await ext.activate();
     });
 
     suite('PeersManager', () => {
@@ -21,7 +21,7 @@ suite('Extension Test Suite', () => {
 
         setup(() => {
             // 使用临时目录创建 PeersManager
-            const tempDir = '/tmp/oschat-test-' + Date.now();
+            const tempDir = path.join(os.tmpdir(), 'oschat-test-' + Date.now());
             const context = {
                 globalStorageUri: { fsPath: tempDir },
                 subscriptions: []
@@ -155,7 +155,7 @@ suite('Extension Test Suite', () => {
 
         test('should create transfer task', () => {
             // 先添加一个 peer
-            const peerInfo: PeerInfo = {
+            const _peerInfo: PeerInfo = {
                 id: '192.168.1.100:8080',
                 hostname: 'PC-Test',
                 ip: '192.168.1.100',
@@ -300,7 +300,7 @@ suite('Extension Test Suite', () => {
                 peerIp: '192.168.1.100',
                 peerPort: 8080,
                 messages: ['hello'],
-                files: [{ name: 'test.txt', path: '/tmp/test.txt', size: 100 }],
+                files: [{ name: 'test.txt', path: path.join(os.tmpdir(), 'test.txt'), size: 100 }],
                 status: 'pending',
                 progress: 0,
                 totalBytes: 100,

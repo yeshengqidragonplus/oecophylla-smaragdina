@@ -27,7 +27,7 @@
 
 ## 网络与防火墙要求
 
-插件使用以下端口（详细协议设计见[设计文档](docs/DESIGN.md)）：
+插件使用以下端口（详细协议设计见仓库中的 docs/DESIGN.md）：
 
 | 端口 | 协议 | 用途 |
 |------|------|------|
@@ -69,8 +69,8 @@ peers.json 格式示例：
 - `npm run test` - 运行测试
 - `npm run compile-tests && node smoke-test.js` - 端到端冒烟测试（同机双实例互发消息/文件，不依赖 VS Code）
 
-架构与协议设计详见 [docs/DESIGN.md](docs/DESIGN.md)，开发约定见 [CLAUDE.md](CLAUDE.md)。
+架构与协议设计详见仓库中的 docs/DESIGN.md，开发约定见 CLAUDE.md。
 
 ## 版本说明
 
-见 [CHANGELOG.md](CHANGELOG.md)。
+见插件的“更新日志”页（CHANGELOG.md）。

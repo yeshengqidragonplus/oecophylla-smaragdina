@@ -1,7 +1,7 @@
 import * as vscode from 'vscode';
 import * as fs from 'fs';
 import * as path from 'path';
-import { PeersManager, StoredPeerInfo } from './peersManager';
+import { PeersManager } from './peersManager';
 import { log, logError } from './logger';
 import { getBuildHash } from './buildInfo';
 import { networkService, NetworkMessage, TransferTask } from './networkService';
@@ -101,7 +101,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 
     public resolveWebviewView(
         webviewView: vscode.WebviewView,
-        context: vscode.WebviewViewResolveContext,
+        _context: vscode.WebviewViewResolveContext,
         _token: vscode.CancellationToken
     ): void {
         this._view = webviewView;

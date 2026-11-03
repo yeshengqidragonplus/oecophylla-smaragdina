@@ -49,7 +49,7 @@ export class PeersEditor {
 
         // 监听配置变化
         this._panel.onDidChangeViewState(
-            e => {
+            _e => {
                 if (this._panel.visible) {
                     this._update();
                 }
