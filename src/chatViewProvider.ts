@@ -258,7 +258,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
                 content += '请点击"编辑聊天对象"或在 peers.json 文件中添加配置';
             } else {
                 peers.forEach(peer => {
-                    const status = peer.status === 'online' ? '🟢' : '⚪';
+                    const status = peer.status === 'online' ? '🟢' : peer.status === 'oneway' ? '🟡' : '⚪';
                     const displayName = this._peersManager.getPeerDisplayName(peer);
                     content += `${status} ${displayName}\n`;
                     content += `   IP: ${peer.ip}:${peer.port}\n`;
@@ -328,12 +328,17 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
      * 查找或创建与指定 peer 关联的会话
      */
     private _getOrCreateSessionForPeer(peerId: string, displayName: string): ChatSession {
-        let session = this._sessions.find(s => s.peerId === peerId);
+        const canonical = this._peersManager.canonicalId(peerId);
+        let session = this._findSessionByPeer(canonical);
+        if (session && session.peerId !== canonical) {
+            // 旧会话保存的是旧版 ip:端口 或换 IP 前的地址：升级为联系人的稳定 id
+            session.peerId = canonical;
+        }
         if (!session) {
             session = {
                 id: `${Date.now()}_${Math.random().toString(36).substr(2, 6)}`,
                 title: displayName,
-                peerId: peerId,
+                peerId: canonical,
                 peerName: displayName,
                 messages: [],
                 lastUpdated: Date.now()
@@ -345,6 +350,12 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
             }
         }
         return session;
+    }
+
+    /** 查找与某联系人关联的会话（旧会话里保存的别名地址也算同一个联系人） */
+    private _findSessionByPeer(peerId: string): ChatSession | undefined {
+        const canonical = this._peersManager.canonicalId(peerId);
+        return this._sessions.find(s => !!s.peerId && this._peersManager.canonicalId(s.peerId) === canonical);
     }
 
     private _appendMessageToSession(session: ChatSession, message: ChatMessage): void {
@@ -411,7 +422,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 
     private _updateReceiveProgressUI(transferKey: string, transfer: IncomingFileTransfer, progress: number): void {
         // 更新会话中的传输状态
-        const session = this._sessions.find(s => s.peerId === transfer.peerId);
+        const session = this._findSessionByPeer(transfer.peerId);
         if (session) {
             session.transferStatus = 'transferring';
             session.transferProgress = progress;
@@ -461,7 +472,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
             this._incomingFileTransfers.delete(transferKey);
 
             // 更新会话状态
-            const session = this._sessions.find(s => s.peerId === transfer.peerId);
+            const session = this._findSessionByPeer(transfer.peerId);
             if (session) {
                 session.transferStatus = 'completed';
                 session.transferProgress = 100;
@@ -491,7 +502,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
             console.error('文件接收失败:', errorMsg);
 
             // 更新会话状态为失败
-            const session = this._sessions.find(s => s.peerId === transfer.peerId);
+            const session = this._findSessionByPeer(transfer.peerId);
             if (session) {
                 session.transferStatus = 'failed';
                 this._saveSessions();
@@ -714,7 +725,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 
     private _updateTransferProgress(task: TransferTask): void {
         // 找到关联的会话
-        const session = this._sessions.find(s => s.peerId === task.peerId);
+        const session = this._findSessionByPeer(task.peerId);
         if (session) {
             session.transferStatus = task.status === 'completed' ? 'completed' :
                                      task.status === 'transferring' ? 'transferring' :
@@ -1694,7 +1705,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 
             const html = allPeers.map((peer, idx) => {
                 const isSelected = peer.id === selectedPeer ? 'selected' : '';
-                const status = peer.status === 'online' ? '🟢' : '⚪';
+                const status = peer.status === 'online' ? '🟢' : peer.status === 'oneway' ? '🟡' : '⚪';
                 const displayName = escapeHtml(peer.displayName);
                 console.log('[DEBUG] rendering peer idx:', idx, 'peer.id:', peer.id, 'displayName:', displayName, 'selected:', isSelected);
                 return \`<div class="target-dropdown-item \${isSelected}" data-peer-id="\${peer.id}">

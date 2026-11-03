@@ -82,49 +82,24 @@ export class PeersEditor {
     }
 
     private async _addPeer(peer: { hostname: string; nickname?: string; ip: string; port: number }): Promise<void> {
-        const id = `${peer.ip}:${peer.port}`;
-        
-        const peerInfo: StoredPeerInfo = {
-            id,
-            hostname: peer.hostname,
-            nickname: peer.nickname,
-            ip: peer.ip,
-            port: peer.port,
-            lastSeen: Date.now(),
-            status: 'offline'
-        };
-
-        this._peersManager.updatePeer(peerInfo);
+        this._peersManager.addPeer(peer.ip, peer.port, peer.nickname, peer.hostname);
         vscode.window.showInformationMessage(`已添加聊天对象：${peer.hostname}`);
         this._update();
     }
 
     private async _updatePeer(peer: { id: string; hostname: string; nickname?: string; ip: string; port: number }): Promise<void> {
-        const existingPeer = this._peersManager.getPeerById(peer.id);
-        
-        if (!existingPeer) {
+        const edited = this._peersManager.editPeer(peer.id, {
+            hostname: peer.hostname,
+            nickname: peer.nickname,
+            ip: peer.ip,
+            port: peer.port
+        });
+
+        if (!edited) {
             vscode.window.showErrorMessage('未找到该聊天对象');
             return;
         }
 
-        const newId = `${peer.ip}:${peer.port}`;
-        
-        // 如果 ID 改变了，先删除旧的
-        if (peer.id !== newId) {
-            this._peersManager.removePeer(peer.id);
-        }
-
-        const peerInfo: StoredPeerInfo = {
-            id: newId,
-            hostname: peer.hostname,
-            nickname: peer.nickname,
-            ip: peer.ip,
-            port: peer.port,
-            lastSeen: existingPeer.lastSeen,
-            status: existingPeer.status
-        };
-
-        this._peersManager.updatePeer(peerInfo);
         vscode.window.showInformationMessage(`已更新聊天对象：${peer.hostname}`);
         this._update();
     }
@@ -180,8 +155,8 @@ export class PeersEditor {
                     ${peers.map(peer => `
                         <tr>
                             <td>
-                                <span class="status-indicator ${peer.status === 'online' ? 'status-online' : 'status-offline'}"></span>
-                                ${peer.status === 'online' ? '在线' : '离线'}
+                                <span class="status-indicator status-${peer.status}"></span>
+                                ${peer.status === 'online' ? '在线' : peer.status === 'oneway' ? '单向（可能被防火墙拦截）' : '离线'}
                             </td>
                             <td>${this._escapeHtml(peer.hostname)}</td>
                             <td>${peer.nickname ? this._escapeHtml(peer.nickname) : '-'}</td>
@@ -333,6 +308,10 @@ export class PeersEditor {
         
         .status-online {
             background-color: #4caf50;
+        }
+        
+        .status-oneway {
+            background-color: #e2b93d;
         }
         
         .status-offline {
@@ -575,8 +554,8 @@ export class PeersEditor {
                         \${peers.map(peer => \`
                             <tr>
                                 <td>
-                                    <span class="status-indicator \${peer.status === 'online' ? 'status-online' : 'status-offline'}"></span>
-                                    \${peer.status === 'online' ? '在线' : '离线'}
+                                    <span class="status-indicator status-\${peer.status}"></span>
+                                    \${peer.status === 'online' ? '在线' : peer.status === 'oneway' ? '单向（可能被防火墙拦截）' : '离线'}
                                 </td>
                                 <td>\${escapeHtml(peer.hostname)}</td>
                                 <td>\${peer.nickname ? escapeHtml(peer.nickname) : '-'}</td>

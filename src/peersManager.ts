@@ -1,7 +1,13 @@
 import * as vscode from 'vscode';
 import * as path from 'path';
-import { PeerFileStore, mergePeers } from './core/peerFileStore';
+import { PeerFileStore } from './core/peerFileStore';
+import { PeerRecord, PeerRegistry, PersistedPeer, Presence } from './core/peerRegistry';
+import { networkService } from './core/networkService';
 
+/**
+ * 联系人视图：供侧边栏与联系人编辑器使用。
+ * 数据来自 PeerRegistry（对端唯一数据源），这里只是它的只读投影。
+ */
 export interface StoredPeerInfo {
     id: string;
     hostname: string;
@@ -9,14 +15,24 @@ export interface StoredPeerInfo {
     ip: string;
     port: number;
     lastSeen: number;
-    status: 'online' | 'offline';
+    /** 在线三态：online / oneway（能收到对方的包但无往返确认）/ offline */
+    status: Presence;
+    /** 用户手工添加或编辑过 */
+    manual: boolean;
+    /** 对端系统与版本，如 "darwin · v0.1.0"（旧版对端为空） */
+    platform?: string;
 }
 
+/**
+ * 联系人管理：负责 peers.json 的持久化与 VS Code 配置，状态本身由 PeerRegistry 持有。
+ * - 在线状态不落盘：每次启动都从"全部离线"开始，由发现与探测重新确认；
+ * - 读不出可信内容时绝不写盘（路径不可用 / 文件损坏），见 PeerFileStore。
+ */
 export class PeersManager {
     private _peersFilePath: string = '';
-    private _peers: Map<string, StoredPeerInfo> = new Map();
     private _context: vscode.ExtensionContext;
-    private _store: PeerFileStore<StoredPeerInfo>;
+    private _registry: PeerRegistry;
+    private _store: PeerFileStore<PersistedPeer>;
     /** 是否已成功从文件读取过（路径不可用时为 false，期间不写盘，路径恢复后合并再写） */
     private _loaded: boolean = false;
     /** 文件损坏时的保护原因：非空表示拒绝写盘，直到用户修复后重新加载 */
@@ -24,18 +40,27 @@ export class PeersManager {
     private _warned: Set<string> = new Set();
     /** 写盘防抖定时器：心跳等高频更新合并为一次写入 */
     private _saveTimer: NodeJS.Timeout | null = null;
+    /** 上次落盘内容的指纹（不含 lastSeen）：没有实质变化就不写盘 */
+    private _lastSavedFingerprint: string = '';
+    private _suppressChange: boolean = false;
 
-    constructor(context: vscode.ExtensionContext) {
+    constructor(context: vscode.ExtensionContext, registry: PeerRegistry = networkService.registry) {
         this._context = context;
+        this._registry = registry;
         this._updatePeersFilePath();
-        this._store = new PeerFileStore<StoredPeerInfo>(this._peersFilePath);
+        this._store = new PeerFileStore<PersistedPeer>(this._peersFilePath);
         this._loadPeers();
+        this._registry.on('change', () => {
+            if (!this._suppressChange) {
+                this._scheduleSave();
+            }
+        });
     }
 
     private _updatePeersFilePath(): void {
         const config = vscode.workspace.getConfiguration('oschat');
         const customPath = config.get<string>('peersFilePath', '');
-        
+
         if (customPath) {
             this._peersFilePath = path.join(customPath, 'peers.json');
         } else {
@@ -50,13 +75,14 @@ export class PeersManager {
 
         const result = this._store.load();
         if (result.ok) {
-            this._peers = this._normalize(result.items);
+            this._withoutSaving(() => this._registry.load(result.items));
             this._loaded = true;
+            this._lastSavedFingerprint = this._fingerprint();
             console.log(`Loaded ${result.items.length} peers from ${this._peersFilePath}`);
             return;
         }
 
-        this._peers = new Map();
+        this._withoutSaving(() => this._registry.load([]));
         this._loaded = false;
         if (result.reason === 'corrupt') {
             this._protectedReason = result.message;
@@ -65,14 +91,13 @@ export class PeersManager {
         this._warnOnce(result.message);
     }
 
-    /** 补全缺失的 id（旧文件没有 id 字段时按 ip:port 生成） */
-    private _normalize(items: StoredPeerInfo[]): Map<string, StoredPeerInfo> {
-        return new Map(items.map(p => {
-            if (!p.id) {
-                p.id = `${p.ip}:${p.port}`;
-            }
-            return [p.id, p];
-        }));
+    private _withoutSaving(action: () => void): void {
+        this._suppressChange = true;
+        try {
+            action();
+        } finally {
+            this._suppressChange = false;
+        }
     }
 
     private _warnOnce(message: string): void {
@@ -96,9 +121,13 @@ export class PeersManager {
             }
             return false;
         }
-        this._peers = mergePeers(Array.from(this._normalize(result.items).values()), this._peers);
+        this._withoutSaving(() => this._registry.mergePersisted(result.items));
         this._loaded = true;
         return true;
+    }
+
+    private _fingerprint(): string {
+        return JSON.stringify(this._registry.toPersisted().map(p => ({ ...p, lastSeen: 0 })));
     }
 
     private _savePeers(): void {
@@ -109,55 +138,18 @@ export class PeersManager {
             return;
         }
         try {
-            this._store.save(Array.from(this._peers.values()));
+            this._store.save(this._registry.toPersisted());
+            this._lastSavedFingerprint = this._fingerprint();
         } catch (err) {
             console.error('Failed to save peers:', err);
         }
     }
 
     /**
-     * 添加或更新 peer。
-     * lastSeen 只在内存中更新；仅当有意义的字段（状态/地址/名称）变化时才写盘。
-     */
-    public updatePeer(peerInfo: StoredPeerInfo): void {
-        const existingPeer = this._peers.get(peerInfo.id);
-
-        if (existingPeer) {
-            existingPeer.lastSeen = peerInfo.lastSeen;
-
-            let changed = false;
-            if (existingPeer.status !== peerInfo.status) {
-                existingPeer.status = peerInfo.status;
-                changed = true;
-            }
-            if (existingPeer.ip !== peerInfo.ip || existingPeer.port !== peerInfo.port) {
-                existingPeer.ip = peerInfo.ip;
-                existingPeer.port = peerInfo.port;
-                changed = true;
-            }
-            if (peerInfo.nickname && existingPeer.nickname !== peerInfo.nickname) {
-                existingPeer.nickname = peerInfo.nickname;
-                changed = true;
-            }
-            if (peerInfo.hostname && existingPeer.hostname !== peerInfo.hostname) {
-                existingPeer.hostname = peerInfo.hostname;
-                changed = true;
-            }
-
-            if (changed) {
-                this._scheduleSave();
-            }
-        } else {
-            this._peers.set(peerInfo.id, { ...peerInfo });
-            this._scheduleSave();
-        }
-    }
-
-    /**
-     * 防抖写盘：2 秒内的多次更新合并为一次
+     * 防抖写盘：2 秒内的多次变化合并为一次；没有实质变化（只有在线状态、lastSeen 在变）时不写盘
      */
     private _scheduleSave(): void {
-        if (this._saveTimer) {
+        if (this._saveTimer || this._fingerprint() === this._lastSavedFingerprint) {
             return;
         }
         this._saveTimer = setTimeout(() => {
@@ -167,43 +159,61 @@ export class PeersManager {
     }
 
     /**
-     * 立即落盘待保存的更改（插件停用时调用）
+     * 立即落盘（插件停用时调用）；lastSeen 只在这里与实质变化时写入
      */
     public flush(): void {
         if (this._saveTimer) {
             clearTimeout(this._saveTimer);
             this._saveTimer = null;
-            this._savePeers();
         }
+        this._savePeers();
+    }
+
+    private _toView(rec: PeerRecord): StoredPeerInfo {
+        const meta = rec.meta;
+        const platform = meta?.os
+            ? [meta.os, meta.version ? `v${meta.version}` : ''].filter(Boolean).join(' · ')
+            : undefined;
+        return {
+            id: rec.id,
+            hostname: rec.hostname,
+            nickname: rec.nickname,
+            ip: rec.ip,
+            port: rec.port,
+            lastSeen: rec.lastSeen,
+            status: rec.presence,
+            manual: rec.manual,
+            platform
+        };
     }
 
     /**
      * 手动添加 peer（通过 IP 和端口）
      */
     public addPeer(ip: string, port: number, nickname?: string, hostname?: string): StoredPeerInfo {
-        const peerId = `${ip}:${port}`;
-        
-        const peerInfo: StoredPeerInfo = {
-            id: peerId,
-            hostname: hostname || ip,
-            nickname: nickname,
-            ip: ip,
-            port: port,
-            lastSeen: Date.now(),
-            status: 'offline'
-        };
-
-        this._peers.set(peerId, peerInfo);
+        const rec = this._registry.addManual(ip, port, nickname, hostname);
         this._savePeers();
-        
-        return peerInfo;
+        return this._toView(rec);
     }
 
     /**
-     * 删除 peer
+     * 编辑 peer：改地址会换 id，旧 id 保留为别名，已有会话仍能对应到该联系人
+     */
+    public editPeer(id: string, patch: { hostname?: string; nickname?: string; ip?: string; port?: number }): StoredPeerInfo | undefined {
+        const rec = this._registry.edit(id, patch);
+        if (!rec) {
+            return undefined;
+        }
+        this._savePeers();
+        return this._toView(rec);
+    }
+
+    /**
+     * 删除 peer：同时从运行时注册表移除，不会在下个心跳时"复活"
+     * （对方若仍在线并持续发现，会作为新发现的联系人重新出现）
      */
     public removePeer(id: string): void {
-        this._peers.delete(id);
+        this._registry.remove(id);
         this._savePeers();
     }
 
@@ -211,7 +221,7 @@ export class PeersManager {
      * 获取所有 peers
      */
     public getPeers(): StoredPeerInfo[] {
-        return Array.from(this._peers.values());
+        return this._registry.list().map(rec => this._toView(rec));
     }
 
     /**
@@ -222,29 +232,25 @@ export class PeersManager {
     }
 
     /**
-     * 根据 ID 获取 peer
+     * 根据 ID（或历史别名）获取 peer
      */
     public getPeerById(id: string): StoredPeerInfo | undefined {
-        return this._peers.get(id);
+        const rec = this._registry.resolve(id);
+        return rec ? this._toView(rec) : undefined;
     }
 
     /**
-     * 更新 peer 状态
+     * 规范 ID：别名（旧版 ip:端口、换 IP 前的地址）映射到当前 id；未知 id 原样返回
      */
-    public updatePeerStatus(id: string, status: 'online' | 'offline'): void {
-        const peer = this._peers.get(id);
-        if (peer) {
-            peer.status = status;
-            peer.lastSeen = Date.now();
-            this._savePeers();
-        }
+    public canonicalId(id: string): string {
+        return this._registry.resolve(id)?.id ?? id;
     }
 
     /**
      * 获取 peer 显示名称
      */
     public getPeerDisplayName(peer: StoredPeerInfo): string {
-        return peer.nickname || peer.hostname || peer.ip;
+        return peer.nickname || peer.hostname.replace(/\.local$/i, '') || peer.ip;
     }
 
     /**
@@ -256,10 +262,10 @@ export class PeersManager {
             return '暂无已知的通信对象\n请在 peers.json 文件中配置通信对象的 IP 和端口';
         }
 
+        const icons: Record<Presence, string> = { online: '🟢', oneway: '🟡', offline: '⚪' };
         return peers.map(peer => {
-            const status = peer.status === 'online' ? '🟢' : '⚪';
             const name = this.getPeerDisplayName(peer);
-            return `${status} ${name} - ${peer.ip}:${peer.port}`;
+            return `${icons[peer.status]} ${name} - ${peer.ip}:${peer.port}`;
         }).join('\n');
     }
 

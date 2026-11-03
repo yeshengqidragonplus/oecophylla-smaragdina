@@ -1,9 +1,8 @@
 import * as assert from 'assert';
-import { NetworkService, PeerInfo } from '../../core/networkService';
+import { NetworkService } from '../../core/networkService';
 
 type Internals = {
     _broadcastEnabled: boolean;
-    _peers: Map<string, PeerInfo>;
     _probePeers(): void;
 };
 
@@ -27,7 +26,7 @@ async function waitFor(condition: () => boolean, timeoutMs: number): Promise<boo
 }
 
 suite('发现：单播探测不依赖广播', () => {
-    test('两端都关闭广播；手工配置的对端失联很久后仍能靠单播探测互相找到（回归：旧实现 180 秒后不再探测）', async function () {
+    test('两端都关闭广播；手工配置的对端靠单播探测互相找到，并被认领升级为稳定身份', async function () {
         this.timeout(10_000);
         const portA = randomBasePort();
         const portB = portA + 2000;
@@ -39,22 +38,23 @@ suite('发现：单播探测不依赖广播', () => {
         await b.start(portB);
         try {
             const ip = a.getLocalIp();
-            const peerBId = `${ip}:${portB}`;
-            const peerAId = `${ip}:${portA}`;
 
-            // 模拟 peers.json 里手工配置的对端：离线，且 10 分钟前就见过（旧实现早已停止探测）
-            internals(a)._peers.set(peerBId, {
-                id: peerBId, hostname: '', ip, port: portB, transferPort: portB + 1000,
-                lastSeen: Date.now() - 600_000, status: 'offline'
-            });
+            // 模拟 peers.json 里手工配置的对端：从未联系过（旧实现下，失联超过 180 秒就不再探测）
+            a.registry.addManual(ip, portB, '手工配置的B');
             internals(a)._probePeers();
 
             const aSeesB = await waitFor(
-                () => a.getPeers().some(p => p.id === peerBId && p.status === 'online'), 3000);
+                () => a.getPeers().some(p => p.port === portB && p.status === 'online'), 3000);
             assert.ok(aSeesB, 'A 没有通过单播探测发现 B');
 
-            const bSeesA = await waitFor(() => b.getPeers().some(p => p.id === peerAId), 3000);
+            const bSeesA = await waitFor(() => b.getPeers().some(p => p.port === portA), 3000);
             assert.ok(bSeesA, 'B 没有因 A 的探测而登记 A');
+
+            // 手工条目被认领升级为 B 的实例 ID，昵称与手工标记保留
+            const peerB = a.getPeers().find(p => p.port === portB)!;
+            assert.strictEqual(peerB.id, b.getInstanceId());
+            assert.strictEqual(peerB.nickname, '手工配置的B');
+            assert.strictEqual(peerB.manual, true);
         } finally {
             a.stop();
             b.stop();
@@ -73,14 +73,12 @@ suite('发现：单播探测不依赖广播', () => {
         await b.start(portB);
         try {
             const ip = a.getLocalIp();
-            const peerBId = `${ip}:${portB}`;
-            internals(a)._peers.set(peerBId, {
-                id: peerBId, hostname: '', ip, port: portB, transferPort: portB + 1000,
-                lastSeen: 0, status: 'offline'
-            });
+            a.registry.addManual(ip, portB);
             internals(a)._probePeers();
-            assert.ok(await waitFor(() => a.getPeers().some(p => p.id === peerBId && p.status === 'online'), 3000));
-            assert.strictEqual(a.getPeers().filter(p => p.id === peerBId).length, 1);
+            assert.ok(await waitFor(() => a.getPeers().some(p => p.port === portB && p.status === 'online'), 3000));
+            internals(a)._probePeers();
+            await new Promise(resolve => setTimeout(resolve, 200));
+            assert.strictEqual(a.getPeers().filter(p => p.port === portB).length, 1);
         } finally {
             a.stop();
             b.stop();

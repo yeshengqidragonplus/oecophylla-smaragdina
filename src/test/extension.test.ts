@@ -3,6 +3,7 @@ import * as os from 'os';
 import * as path from 'path';
 import * as vscode from 'vscode';
 import { PeersManager } from '../peersManager';
+import { PeerRegistry } from '../core/peerRegistry';
 import { NetworkService, PeerInfo, NetworkMessage, TransferTask } from '../core/networkService';
 
 suite('Extension Test Suite', () => {
@@ -18,16 +19,23 @@ suite('Extension Test Suite', () => {
 
     suite('PeersManager', () => {
         let peersManager: PeersManager;
+        let registry: PeerRegistry;
 
         setup(() => {
-            // 使用临时目录创建 PeersManager
-            const tempDir = path.join(os.tmpdir(), 'oschat-test-' + Date.now());
+            // 使用临时目录与独立的注册表创建 PeersManager
+            const tempDir = path.join(os.tmpdir(), 'oschat-test-' + Date.now() + '-' + Math.random().toString(36).slice(2));
             const context = {
                 globalStorageUri: { fsPath: tempDir },
                 subscriptions: []
             } as unknown as vscode.ExtensionContext;
-            peersManager = new PeersManager(context);
+            registry = new PeerRegistry();
+            peersManager = new PeersManager(context, registry);
         });
+
+        /** 模拟收到对端的往返确认，使其在线 */
+        const markOnline = (ip: string, port: number): void => {
+            registry.observe({ kind: 'ack', ip, port });
+        };
 
         test('should add a peer', () => {
             const peer = peersManager.addPeer('192.168.1.100', 8080, '测试用户', 'PC-Test');
@@ -53,27 +61,31 @@ suite('Extension Test Suite', () => {
             assert.strictEqual(peer?.nickname, '用户A');
         });
 
-        test('should update peer status', () => {
+        test('在线状态由往返确认决定，而不是手工设置', () => {
             peersManager.addPeer('192.168.1.100', 8080, '用户A');
-            peersManager.updatePeerStatus('192.168.1.100:8080', 'online');
+            markOnline('192.168.1.100', 8080);
             const peer = peersManager.getPeerById('192.168.1.100:8080');
             assert.strictEqual(peer?.status, 'online');
         });
 
-        test('should update existing peer', () => {
+        test('should edit existing peer（改地址后旧 id 仍可解析到该联系人）', () => {
             peersManager.addPeer('192.168.1.100', 8080, '用户A');
-            peersManager.updatePeer({
-                id: '192.168.1.100:8080',
+            const edited = peersManager.editPeer('192.168.1.100:8080', {
                 hostname: 'PC-Updated',
                 nickname: '用户A-改',
-                ip: '192.168.1.100',
-                port: 8080,
-                lastSeen: Date.now(),
-                status: 'online'
+                ip: '192.168.1.101'
             });
-            const peer = peersManager.getPeerById('192.168.1.100:8080');
-            assert.strictEqual(peer?.nickname, '用户A-改');
-            assert.strictEqual(peer?.status, 'online');
+            assert.strictEqual(edited?.id, '192.168.1.101:8080');
+            assert.strictEqual(edited?.nickname, '用户A-改');
+            assert.strictEqual(peersManager.getPeerById('192.168.1.100:8080')?.id, '192.168.1.101:8080');
+            assert.strictEqual(peersManager.getPeers().length, 1);
+        });
+
+        test('删除的联系人不会在下一次发现/心跳时被旧状态"复活"', () => {
+            peersManager.addPeer('192.168.1.100', 8080, '用户A');
+            peersManager.removePeer('192.168.1.100:8080');
+            assert.strictEqual(peersManager.getPeers().length, 0);
+            assert.strictEqual(registry.size, 0);
         });
 
         test('should remove peer', () => {
@@ -86,7 +98,7 @@ suite('Extension Test Suite', () => {
         test('should get online peers only', () => {
             peersManager.addPeer('192.168.1.100', 8080, '用户A');
             peersManager.addPeer('192.168.1.101', 8080, '用户B');
-            peersManager.updatePeerStatus('192.168.1.100:8080', 'online');
+            markOnline('192.168.1.100', 8080);
             const onlinePeers = peersManager.getOnlinePeers();
             assert.strictEqual(onlinePeers.length, 1);
             assert.strictEqual(onlinePeers[0].nickname, '用户A');
@@ -112,7 +124,7 @@ suite('Extension Test Suite', () => {
 
         test('should format peer list', () => {
             peersManager.addPeer('192.168.1.100', 8080, '用户A');
-            peersManager.updatePeerStatus('192.168.1.100:8080', 'online');
+            markOnline('192.168.1.100', 8080);
             const formatted = peersManager.formatPeerList();
             assert.ok(formatted.includes('🟢'));
             assert.ok(formatted.includes('用户A'));
@@ -153,20 +165,13 @@ suite('Extension Test Suite', () => {
             assert.strictEqual(tasks.length, 0);
         });
 
-        test('should create transfer task', () => {
-            // 先添加一个 peer
-            const _peerInfo: PeerInfo = {
-                id: '192.168.1.100:8080',
-                hostname: 'PC-Test',
-                ip: '192.168.1.100',
-                port: 8080,
-                transferPort: 9080,
-                lastSeen: Date.now(),
-                status: 'online'
-            };
-            // 通过私有方法添加 peer，这里我们直接测试 createTransferTask 的异常情况
+        test('createTransferTask：未知但格式合法的 ip:端口 会按约定补建对端；非法 id 抛出 Peer not found', () => {
+            const task = networkService.createTransferTask('192.168.1.100:8080', ['hello'], []);
+            assert.strictEqual(task.peerId, '192.168.1.100:8080');
+            assert.strictEqual(task.status, 'pending');
+            assert.strictEqual(networkService.getPeers().length, 1);
             assert.throws(() => {
-                networkService.createTransferTask('192.168.1.100:8080', ['hello'], []);
+                networkService.createTransferTask('not-a-peer', ['hello'], []);
             }, /Peer/);
         });
 

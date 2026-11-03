@@ -1,8 +1,9 @@
+import * as crypto from 'crypto';
 import * as dgram from 'dgram';
 import * as os from 'os';
 import * as events from 'events';
 import * as fs from 'fs';
-import { KcpTransport, isRetryableKcpError } from './kcpTransport';
+import { KcpTransport, SessionPeerInfo, isRetryableKcpError } from './kcpTransport';
 import { log, logError } from './logger';
 import { classifyNetError, ErrorThrottle, NetErrorInfo } from './netErrors';
 import {
@@ -15,6 +16,10 @@ import {
     pickPrimary
 } from './netInterfaces';
 import { ProbeState, isProbeDue, nextProbeState } from './probeSchedule';
+import { PeerMeta, PeerRecord, PeerRegistry, Presence } from './peerRegistry';
+
+/** 线上协议版本：2 = 带实例 ID / boot 标识 / meta */
+export const PROTOCOL_VERSION = 2;
 
 export interface PeerInfo {
     id: string;
@@ -25,10 +30,17 @@ export interface PeerInfo {
     /** 对端业务消息（KCP）端口 */
     transferPort: number;
     lastSeen: number;
-    status: 'online' | 'offline';
+    /** 在线三态：online / oneway（能收到对方的包但无往返确认）/ offline */
+    status: Presence;
+    /** 新版对端的稳定实例 ID（旧版对端没有） */
+    iid?: string;
+    meta?: PeerMeta;
+    manual?: boolean;
 }
 
 export interface NetworkMessage {
+    /** 业务消息 ID：接收端据此去重（会话重建后重发不会重复显示） */
+    id?: string;
     type: 'message' | 'file'
         | 'discovery_request' | 'discovery_response'
         | 'heartbeat' | 'heartbeat_ack';
@@ -46,6 +58,20 @@ export interface NetworkMessage {
         totalChunks?: number;
     };
     transferPort?: number;
+    /** 协议版本（旧版没有） */
+    proto?: number;
+    /** 发送方实例 ID */
+    iid?: string;
+    /** 发送方本次启动标识：变化说明它重启过 */
+    boot?: string;
+    meta?: PeerMeta;
+}
+
+export interface StartOptions {
+    /** 本机标识（同一台机器稳定不变）；实例 ID = `${machineId}:${端口}`。缺省时每个 NetworkService 随机生成 */
+    machineId?: string;
+    /** 随握手与发现携带的版本信息（os/arch/node 由内部填充） */
+    meta?: Partial<PeerMeta>;
 }
 
 export interface TransferTask {
@@ -64,8 +90,6 @@ export interface TransferTask {
     errorMessage?: string;
 }
 
-/** 心跳超时（毫秒），超过此时间未收到心跳则标记离线 */
-const HEARTBEAT_TIMEOUT = 90_000;
 /** 对端维护节拍（毫秒）：每个节拍检查离线超时，并探测到期的对端（探测节奏见 probeSchedule） */
 const PEER_TICK_INTERVAL = 5_000;
 /** 广播发现间隔（毫秒） */
@@ -90,7 +114,13 @@ export class NetworkService extends events.EventEmitter {
     private _port: number = 8080;
     private _hostname: string;
     private _nickname?: string;
-    private _peers: Map<string, PeerInfo> = new Map();
+    /** 对端唯一数据源（身份、地址、在线三态、持久化快照） */
+    public readonly registry = new PeerRegistry();
+    private _machineId: string = crypto.randomUUID();
+    private _instanceId: string = '';
+    private _meta: PeerMeta = { os: process.platform, arch: process.arch, node: process.versions.node };
+    /** 最近收到的业务消息 ID，用于去重 */
+    private _seenMessageIds: Set<string> = new Set();
     private _isRunning: boolean = false;
     private _transferTasks: Map<string, TransferTask> = new Map();
     private _transport: KcpTransport | null = null;
@@ -119,28 +149,37 @@ export class NetworkService extends events.EventEmitter {
     constructor() {
         super();
         this._hostname = os.hostname();
+        this.registry.on('change', () => this.emit('peersUpdate', this.getPeers()));
+        this.registry.on('restarted', (rec: PeerRecord) => this._onPeerRestarted(rec));
     }
 
     get transport(): KcpTransport | null {
         return this._transport;
     }
 
-    public async start(port: number, nickname?: string, peersFilePath?: string): Promise<void> {
+    public async start(port: number, nickname?: string, options: StartOptions = {}): Promise<void> {
         if (this._isRunning) {
             this.stop();
         }
 
         this._port = port;
         this._nickname = nickname;
-        this._refreshNetwork();
-
-        if (peersFilePath) {
-            this._loadPeersFromFile(peersFilePath);
+        if (options.machineId) {
+            this._machineId = options.machineId;
         }
+        this._instanceId = `${this._machineId}:${port}`;
+        this._meta = {
+            os: process.platform,
+            arch: process.arch,
+            node: process.versions.node,
+            ...options.meta
+        };
+        this._refreshNetwork();
 
         // 启动 KCP 传输层（业务消息通道）
         this._transport = new KcpTransport(this._port);
         this._transport.setLocalId(this._localPeerId());
+        this._transport.setLocalInstanceId(this._instanceId);
         this._setupTransportEvents();
 
         try {
@@ -228,7 +267,7 @@ export class NetworkService extends events.EventEmitter {
             socket.on('message', (msg, rinfo) => {
                 try {
                     const data = JSON.parse(msg.toString());
-                    if (data.type === 'discovery_request' && !this._isSelf(rinfo.address, rinfo.port)) {
+                    if (data.type === 'discovery_request' && !this._isSelfMessage(data, rinfo.address, rinfo.port)) {
                         // rinfo.port 是请求方的主端口（从主 socket 发出）
                         this._handleDiscoveryRequest(data, rinfo.address, rinfo.port);
                     }
@@ -256,15 +295,7 @@ export class NetworkService extends events.EventEmitter {
 
         this._refreshNetwork();
 
-        const message: NetworkMessage = {
-            type: 'discovery_request',
-            from: this.getLocalIp(),
-            fromHostname: this._hostname,
-            fromNickname: this._nickname,
-            timestamp: Date.now(),
-            transferPort: this._transport?.port || (this._port + 1000)
-        };
-        const buffer = Buffer.from(JSON.stringify(message));
+        const buffer = Buffer.from(JSON.stringify(this._baseMessage('discovery_request')));
 
         // 从主 socket 发出（源端口 = 主端口，对方据此回复），目标为共享发现端口
         for (const target of broadcastTargets(this._lanInterfaces)) {
@@ -272,71 +303,62 @@ export class NetworkService extends events.EventEmitter {
         }
     }
 
+    /** 本机发出的所有 UDP 消息共用的头部：旧字段保持不变（兼容旧版），新增协议版本、实例 ID、boot 与 meta */
+    private _baseMessage(type: NetworkMessage['type'], to?: string): NetworkMessage {
+        return {
+            type,
+            from: this.getLocalIp(),
+            fromHostname: this._hostname,
+            fromNickname: this._nickname,
+            to,
+            timestamp: Date.now(),
+            transferPort: this._transport?.port || (this._port + 1000),
+            proto: PROTOCOL_VERSION,
+            iid: this._instanceId,
+            boot: this._transport?.boot,
+            meta: this._meta
+        };
+    }
+
     /**
      * 处理发现请求 - 回复自己的信息
      */
     private _handleDiscoveryRequest(msg: NetworkMessage, ip: string, port: number): void {
-        const response: NetworkMessage = {
-            type: 'discovery_response',
-            from: this.getLocalIp(),
-            fromHostname: this._hostname,
-            fromNickname: this._nickname,
-            to: `${ip}:${port}`,
-            timestamp: Date.now(),
-            transferPort: this._transport?.port || (this._port + 1000)
-        };
-
-        this._sendTo(ip, port, response);
-        this._upsertPeerFromUdp(msg, ip, port, 'Discovery');
+        this._sendTo(ip, port, this._baseMessage('discovery_response', `${ip}:${port}`));
+        this._observeFromUdp(msg, ip, port, 'inbound', 'Discovery');
     }
 
     /**
-     * 处理发现响应
+     * 处理发现响应：往返确认
      */
     private _handleDiscoveryResponse(msg: NetworkMessage, ip: string, port: number): void {
-        this._upsertPeerFromUdp(msg, ip, port, 'Discovery');
+        this._observeFromUdp(msg, ip, port, 'ack', 'Discovery');
     }
 
     /**
-     * 根据 UDP 消息新建或刷新 peer 信息
+     * 把收到的 UDP 消息登记到注册表。
+     * 地址取自 rinfo（观察值）而不是对端自称的 from；身份优先用对端的实例 ID。
      */
-    private _upsertPeerFromUdp(msg: NetworkMessage, ip: string, port: number, logTag: string): void {
-        const peerId = `${ip}:${port}`;
-        const existingPeer = this._peers.get(peerId);
-
-        if (existingPeer) {
-            const wasOffline = existingPeer.status === 'offline';
-            existingPeer.lastSeen = Date.now();
-            existingPeer.status = 'online';
-            existingPeer.transferPort = msg.transferPort || (port + 1000);
-            if (msg.fromNickname) {
-                existingPeer.nickname = msg.fromNickname;
-            }
-            if (msg.fromHostname) {
-                existingPeer.hostname = msg.fromHostname;
-            }
-            if (wasOffline) {
-                log(`[${logTag}] Peer ${peerId} came back online`);
-            }
-        } else {
-            const peerInfo: PeerInfo = {
-                id: peerId,
-                hostname: msg.fromHostname || ip,
-                nickname: msg.fromNickname,
-                ip: ip,
-                port: port,
-                transferPort: msg.transferPort || (port + 1000),
-                lastSeen: Date.now(),
-                status: 'online'
-            };
-            this._peers.set(peerId, peerInfo);
-            log(`[${logTag}] New peer found: ${peerId}`);
+    private _observeFromUdp(msg: NetworkMessage, ip: string, port: number, kind: 'inbound' | 'ack', logTag: string): void {
+        const known = !!this.registry.findByAddress(ip, port) || (!!msg.iid && !!this.registry.resolve(msg.iid));
+        const rec = this.registry.observe({
+            kind,
+            ip,
+            port,
+            transferPort: msg.transferPort,
+            iid: msg.iid,
+            boot: msg.boot,
+            proto: msg.proto,
+            meta: msg.meta,
+            hostname: msg.fromHostname,
+            nickname: msg.fromNickname
+        });
+        if (!known) {
+            log(`[${logTag}] New peer found: ${rec.id}（${ip}:${port}）`);
         }
-
-        this.emit('peersUpdate', Array.from(this._peers.values()));
     }
 
-    // ==================== 心跳检测 ====================
+    // ==================== 对端维护与探测 ====================
 
     /**
      * 启动对端维护节拍，并立即探测一轮（启动时已加载的对端无需等第一个节拍）
@@ -346,7 +368,7 @@ export class NetworkService extends events.EventEmitter {
             clearInterval(this._peerTickTimer);
         }
         this._peerTickTimer = setInterval(() => {
-            this._checkPeerLiveness();
+            this.registry.sweep();
             this._probePeers();
         }, PEER_TICK_INTERVAL);
         this._probePeers();
@@ -354,7 +376,7 @@ export class NetworkService extends events.EventEmitter {
 
     /**
      * 探测所有已知对端（不再看 lastSeen）：
-     * 在线的发心跳；离线的发单播发现请求——对方收到会回应并登记我们，
+     * 有联系的（online / oneway）发心跳；离线的发单播发现请求——对方收到会回应并登记我们，
      * 这是广播到不了（跨网段、广播被过滤）时找回手工配置对端的唯一途径。
      */
     private _probePeers(): void {
@@ -362,47 +384,14 @@ export class NetworkService extends events.EventEmitter {
             return;
         }
         const now = Date.now();
-        this._peers.forEach(peer => {
-            const online = peer.status === 'online';
+        for (const peer of this.registry.list()) {
+            const alive = peer.presence !== 'offline';
             const state = this._probeState.get(peer.id);
-            if (!isProbeDue(online, state, now)) {
-                return;
+            if (!isProbeDue(alive, state, now)) {
+                continue;
             }
-            this._probeState.set(peer.id, nextProbeState(online, state, now));
-            this._sendProbe(peer, online ? 'heartbeat' : 'discovery_request');
-        });
-    }
-
-    private _sendProbe(peer: PeerInfo, type: 'heartbeat' | 'discovery_request'): void {
-        const message: NetworkMessage = {
-            type,
-            from: this.getLocalIp(),
-            fromHostname: this._hostname,
-            fromNickname: this._nickname,
-            to: peer.id,
-            timestamp: Date.now(),
-            transferPort: this._transport?.port || (this._port + 1000)
-        };
-        this._sendTo(peer.ip, peer.port, message);
-    }
-
-    /**
-     * 检查 peer 是否超时离线
-     */
-    private _checkPeerLiveness(): void {
-        const now = Date.now();
-        let changed = false;
-
-        this._peers.forEach((peer, peerId) => {
-            if (peer.status === 'online' && (now - peer.lastSeen > HEARTBEAT_TIMEOUT)) {
-                peer.status = 'offline';
-                log(`[Heartbeat] Peer ${peerId} timed out, marked offline`);
-                changed = true;
-            }
-        });
-
-        if (changed) {
-            this.emit('peersUpdate', Array.from(this._peers.values()));
+            this._probeState.set(peer.id, nextProbeState(alive, state, now));
+            this._sendTo(peer.ip, peer.port, this._baseMessage(alive ? 'heartbeat' : 'discovery_request', peer.id));
         }
     }
 
@@ -410,25 +399,21 @@ export class NetworkService extends events.EventEmitter {
      * 处理收到的心跳，并回复确认
      */
     private _handleHeartbeat(msg: NetworkMessage, ip: string, port: number): void {
-        this._upsertPeerFromUdp(msg, ip, port, 'Heartbeat');
-
-        const ack: NetworkMessage = {
-            type: 'heartbeat_ack',
-            from: this.getLocalIp(),
-            fromHostname: this._hostname,
-            fromNickname: this._nickname,
-            to: `${ip}:${port}`,
-            timestamp: Date.now(),
-            transferPort: this._transport?.port || (this._port + 1000)
-        };
-        this._sendTo(ip, port, ack);
+        this._observeFromUdp(msg, ip, port, 'inbound', 'Heartbeat');
+        this._sendTo(ip, port, this._baseMessage('heartbeat_ack', `${ip}:${port}`));
     }
 
     /**
-     * 处理心跳确认
+     * 处理心跳确认：往返确认
      */
     private _handleHeartbeatAck(msg: NetworkMessage, ip: string, port: number): void {
-        this._upsertPeerFromUdp(msg, ip, port, 'Heartbeat');
+        this._observeFromUdp(msg, ip, port, 'ack', 'Heartbeat');
+    }
+
+    /** 对端重启过（boot 标识变了）：旧的 KCP 会话已是僵尸，立即销毁，下次发送自动重建 */
+    private _onPeerRestarted(rec: PeerRecord): void {
+        log(`[Peer] ${rec.id} 已重启（boot 标识变化），销毁旧的 KCP 会话`);
+        this._transport?.disconnect(rec.id);
     }
 
     // ==================== KCP 传输层事件 ====================
@@ -445,21 +430,28 @@ export class NetworkService extends events.EventEmitter {
             try {
                 const msg = JSON.parse(data.toString()) as NetworkMessage;
                 msg.from = peerId;
+                if (msg.id && this._isDuplicateMessage(msg.id)) {
+                    log(`[消息] 忽略重复消息 ${msg.id}（会话重建后的重发）`);
+                    return;
+                }
                 this.emit('message', msg);
             } catch (err) {
                 logError('Failed to parse KCP message:', err);
             }
         });
 
-        this._transport.on('sessionConnected', (peerId: string) => {
+        this._transport.on('sessionConnected', (peerId: string, info?: SessionPeerInfo) => {
             log(`KCP session connected: ${peerId}`);
-            const peer = this._peers.get(peerId);
-            if (peer) {
-                peer.lastSeen = Date.now();
-                if (peer.status === 'offline') {
-                    peer.status = 'online';
-                    this.emit('peersUpdate', Array.from(this._peers.values()));
-                }
+            if (info) {
+                // 入站握手成功：双方都能收到对方的包，等同往返确认
+                this.registry.observe({
+                    kind: 'kcp',
+                    ip: info.ip,
+                    port: info.port,
+                    transferPort: info.transferPort,
+                    iid: info.iid,
+                    boot: info.boot
+                });
             }
         });
 
@@ -477,30 +469,22 @@ export class NetworkService extends events.EventEmitter {
         });
     }
 
-    // ==================== 消息处理 ====================
-
-    private _loadPeersFromFile(filePath: string): void {
-        try {
-            if (fs.existsSync(filePath)) {
-                const data = fs.readFileSync(filePath, 'utf-8');
-                const peersArray = JSON.parse(data) as PeerInfo[];
-                peersArray.forEach(peer => {
-                    const peerId = `${peer.ip}:${peer.port}`;
-                    this._peers.set(peerId, {
-                        ...peer,
-                        id: peerId,
-                        transferPort: peer.transferPort || (peer.port + 1000),
-                        lastSeen: Date.now(),
-                        status: 'offline'
-                    });
-                });
-                log(`Loaded ${peersArray.length} peers from ${filePath}`);
-                this.emit('peersUpdate', Array.from(this._peers.values()));
-            }
-        } catch (err) {
-            logError('Failed to load peers from file:', err);
+    /** 业务消息去重：只保留最近 512 个 ID */
+    private _isDuplicateMessage(id: string): boolean {
+        if (this._seenMessageIds.has(id)) {
+            return true;
         }
+        this._seenMessageIds.add(id);
+        if (this._seenMessageIds.size > 512) {
+            const oldest = this._seenMessageIds.values().next().value;
+            if (oldest !== undefined) {
+                this._seenMessageIds.delete(oldest);
+            }
+        }
+        return false;
     }
+
+    // ==================== 消息处理 ====================
 
     public stop(): void {
         this._isRunning = false;
@@ -535,10 +519,8 @@ export class NetworkService extends events.EventEmitter {
             this._discoverySocket = null;
         }
 
-        this._peers.forEach(peer => {
-            peer.status = 'offline';
-        });
-        this.emit('peersUpdate', Array.from(this._peers.values()));
+        this.registry.markAllOffline();
+        this.emit('peersUpdate', this.getPeers());
     }
 
     /**
@@ -547,6 +529,14 @@ export class NetworkService extends events.EventEmitter {
      */
     private _isSelf(ip: string, port: number): boolean {
         return port === this._port && this._localIps.has(ip);
+    }
+
+    /** 自己发出的消息：地址与端口都是本机，或消息里的实例 ID 就是自己（后者不受本机 IP 变化影响） */
+    private _isSelfMessage(data: { iid?: string }, ip: string, port: number): boolean {
+        if (data.iid && data.iid === this._instanceId) {
+            return true;
+        }
+        return this._isSelf(ip, port);
     }
 
     /**
@@ -558,7 +548,7 @@ export class NetworkService extends events.EventEmitter {
             const peerIp = rinfo.address;
             const peerPort = rinfo.port;
 
-            if (this._isSelf(peerIp, peerPort)) {
+            if (this._isSelfMessage(data, peerIp, peerPort)) {
                 return;
             }
 
@@ -584,13 +574,13 @@ export class NetworkService extends events.EventEmitter {
     }
 
     /**
-     * 解析 peerId 对应的 PeerInfo。
-     * 若不在已知列表（如启动后才在 peers 编辑器中新增的对象），
+     * 解析 peerId（实例 ID、旧版 ip:端口 或历史别名）对应的对端记录。
+     * 若不在已知列表（如启动后才在联系人编辑器中新增的对象），
      * 则按 peerId 的 `ip:端口` 约定即时补建一条记录——
      * KCP 握手建连（5 秒超时）本身就是在线检测，无需等发现/心跳。
      */
-    private _resolvePeer(peerId: string): PeerInfo {
-        const existing = this._peers.get(peerId);
+    private _resolvePeer(peerId: string): PeerRecord {
+        const existing = this.registry.resolve(peerId);
         if (existing) {
             return existing;
         }
@@ -600,54 +590,46 @@ export class NetworkService extends events.EventEmitter {
         if (!ip || !Number.isInteger(port) || port <= 0 || port > 65535) {
             throw new Error(`Peer ${peerId} not found`);
         }
-        const peer: PeerInfo = {
-            id: peerId,
-            hostname: '',
-            ip,
-            port,
-            transferPort: port + 1000,
-            lastSeen: Date.now(),
-            status: 'offline'
-        };
-        this._peers.set(peerId, peer);
+        const peer = this.registry.ensureByAddress(ip, port);
         log(`[Peer] ${peerId} 不在运行时列表，按约定补建（KCP 端口 ${peer.transferPort}）`);
-        this.emit('peersUpdate', Array.from(this._peers.values()));
         return peer;
     }
 
     /**
-     * 确保与指定 peer 建立了 KCP 会话
+     * 确保与指定 peer 建立了 KCP 会话（传输层以对端记录的规范 id 为键）
      */
     private async _ensureSession(peerId: string): Promise<void> {
         const peer = this._resolvePeer(peerId);
         if (!this._transport) {
             throw new Error('传输层未启动');
         }
-        if (this._transport.hasSession(peerId)) {
-            log(`[会话] 复用已有 KCP 会话: ${peerId}`);
+        if (this._transport.hasSession(peer.id)) {
+            log(`[会话] 复用已有 KCP 会话: ${peer.id}`);
             return;
         }
         log(`[会话] 向 ${peer.ip}:${peer.transferPort}（UDP/KCP）发起握手，超时 ${CONNECT_TIMEOUT}ms ...`);
-        await this._transport.connect(peerId, peer.ip, peer.transferPort, CONNECT_TIMEOUT);
-        log(`[会话] 与 ${peerId} 的 KCP 会话已建立`);
+        await this._transport.connect(peer.id, peer.ip, peer.transferPort, CONNECT_TIMEOUT);
+        this.registry.markAck(peer.id);
+        log(`[会话] 与 ${peer.id} 的 KCP 会话已建立`);
     }
 
     /**
      * 通过 KCP 发送消息到指定 peer。
      * 会话失效类错误（对端重启/睡眠后残留的僵尸会话、确认超时）时，销毁旧会话、重新握手并重发一次——
-     * 用户不必手动点第二次。重发的是完整帧，对端文件分块按块号去重，不会重复落盘。
+     * 用户不必手动点第二次。重发的是完整帧：文本消息带 id、接收端去重；文件分块按块号去重。
      */
     private async _sendViaTransport(peerId: string, message: NetworkMessage): Promise<void> {
+        const peer = this._resolvePeer(peerId);
         const data = Buffer.from(JSON.stringify(message));
         for (let attempt = 0; ; attempt++) {
-            await this._ensureSession(peerId);
+            await this._ensureSession(peer.id);
             try {
-                await this._transport!.send(peerId, data);
+                await this._transport!.send(peer.id, data);
                 return;
             } catch (err) {
                 if (attempt === 0 && isRetryableKcpError(err)) {
                     log(`[会话] 发送失败（${(err as Error).message}），会话可能已失效，重建会话后重试一次`);
-                    this._transport?.disconnect(peerId);
+                    this._transport?.disconnect(peer.id);
                     continue;
                 }
                 throw err;
@@ -667,7 +649,7 @@ export class NetworkService extends events.EventEmitter {
 
         const task: TransferTask = {
             id: taskId,
-            peerId,
+            peerId: peer.id,
             peerIp: peer.ip,
             peerPort: peer.port,
             messages,
@@ -715,6 +697,7 @@ export class NetworkService extends events.EventEmitter {
         try {
             for (const message of task.messages) {
                 const msg: NetworkMessage = {
+                    id: crypto.randomUUID(),
                     type: 'message',
                     from: this._localPeerId(),
                     to: task.peerId,
@@ -862,7 +845,29 @@ export class NetworkService extends events.EventEmitter {
     }
 
     public getPeers(): PeerInfo[] {
-        return Array.from(this._peers.values());
+        return this.registry.list().map(rec => ({
+            id: rec.id,
+            iid: rec.iid,
+            hostname: rec.hostname,
+            nickname: rec.nickname,
+            ip: rec.ip,
+            port: rec.port,
+            transferPort: rec.transferPort,
+            lastSeen: rec.lastSeen,
+            status: rec.presence,
+            meta: rec.meta,
+            manual: rec.manual
+        }));
+    }
+
+    /** 本实例的稳定实例 ID（`${machineId}:${端口}`），服务未启动时为空 */
+    public getInstanceId(): string {
+        return this._instanceId;
+    }
+
+    /** 本次启动标识（传输层未启动时为空） */
+    public getBoot(): string {
+        return this._transport?.boot ?? '';
     }
 
     /** 本端 peerId：`本机IP:主端口` */

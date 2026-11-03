@@ -155,37 +155,60 @@ export class PeerRegistry extends events.EventEmitter {
     load(items: PersistedPeer[]): void {
         this._byId.clear();
         for (const item of items) {
-            if (!item || typeof item.ip !== 'string' || typeof item.port !== 'number') {
-                continue;
+            const rec = this._fromPersisted(item);
+            if (rec && !this._byId.has(rec.id)) {
+                this._byId.set(rec.id, rec);
             }
-            const id = item.iid ?? item.id ?? `${item.ip}:${item.port}`;
-            if (this._byId.has(id)) {
-                continue;
-            }
-            const aliases = new Set(item.aliases ?? []);
-            if (item.id && item.id !== id) {
-                aliases.add(item.id);
-            }
-            aliases.delete(id);
-            this._byId.set(id, {
-                id,
-                iid: item.iid,
-                ip: item.ip,
-                port: item.port,
-                transferPort: item.transferPort ?? item.port + 1000,
-                hostname: item.hostname ?? item.ip,
-                nickname: item.nickname,
-                aliases: Array.from(aliases),
-                manual: item.manual ?? true,
-                firstSeen: item.lastSeen ?? 0,
-                lastSeen: item.lastSeen ?? 0,
-                lastHeard: 0,
-                lastAck: 0,
-                pendingSince: 0,
-                presence: 'offline'
-            });
         }
         this.emit('change');
+    }
+
+    /**
+     * 合并持久化内容：只补充注册表里还没有的条目，已有条目（含运行期状态）保持不变。
+     * 用于 peers.json 所在路径恢复可用（如外接卷重新挂载）后，把文件里的手工配置并回来。
+     */
+    mergePersisted(items: PersistedPeer[]): void {
+        let changed = false;
+        for (const item of items) {
+            const rec = this._fromPersisted(item);
+            if (!rec || this._find(rec.id) || this.findByAddress(rec.ip, rec.port)) {
+                continue;
+            }
+            this._byId.set(rec.id, rec);
+            changed = true;
+        }
+        if (changed) {
+            this.emit('change');
+        }
+    }
+
+    private _fromPersisted(item: PersistedPeer): PeerRecord | null {
+        if (!item || typeof item.ip !== 'string' || typeof item.port !== 'number') {
+            return null;
+        }
+        const id = item.iid ?? item.id ?? `${item.ip}:${item.port}`;
+        const aliases = new Set(item.aliases ?? []);
+        if (item.id && item.id !== id) {
+            aliases.add(item.id);
+        }
+        aliases.delete(id);
+        return {
+            id,
+            iid: item.iid,
+            ip: item.ip,
+            port: item.port,
+            transferPort: item.transferPort ?? item.port + 1000,
+            hostname: item.hostname ?? item.ip,
+            nickname: item.nickname,
+            aliases: Array.from(aliases),
+            manual: item.manual ?? true,
+            firstSeen: item.lastSeen ?? 0,
+            lastSeen: item.lastSeen ?? 0,
+            lastHeard: 0,
+            lastAck: 0,
+            pendingSince: 0,
+            presence: 'offline'
+        };
     }
 
     toPersisted(): PersistedPeer[] {

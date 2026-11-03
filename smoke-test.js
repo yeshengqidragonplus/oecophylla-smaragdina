@@ -18,21 +18,28 @@ async function main() {
     await b.start(18090);
     console.log('两个实例已启动: A=18080/19080, B=18090/19090');
 
-    const localIp = a.getLocalIp();
-    const aId = `${localIp}:18080`;
-    const bId = `${localIp}:18090`;
+    // 对端以稳定的实例 ID 为身份，不再是 ip:端口；按端口在对方的列表里找到彼此
+    let aId = '';
+    let bId = '';
 
-    // 等待 UDP 广播互相发现
+    // 等待 UDP 广播互相发现（往返确认后才算在线）
     const discovered = await new Promise(resolve => {
         const deadline = setTimeout(() => resolve(false), 8000);
         const check = setInterval(() => {
-            const aSeesB = a.getPeers().some(p => p.id === bId && p.status === 'online');
-            const bSeesA = b.getPeers().some(p => p.id === aId && p.status === 'online');
-            if (aSeesB && bSeesA) { clearTimeout(deadline); clearInterval(check); resolve(true); }
+            const bAsSeenByA = a.getPeers().find(p => p.port === 18090 && p.status === 'online');
+            const aAsSeenByB = b.getPeers().find(p => p.port === 18080 && p.status === 'online');
+            if (bAsSeenByA && aAsSeenByB) {
+                bId = bAsSeenByA.id;
+                aId = aAsSeenByB.id;
+                clearTimeout(deadline); clearInterval(check); resolve(true);
+            }
         }, 200);
     });
     console.log(`同机双实例自动发现: ${discovered ? '✅' : '❌ 超时'}`);
     if (!discovered) { process.exit(1); }
+
+    const identityOk = aId === a.getInstanceId() && bId === b.getInstanceId();
+    console.log(`稳定身份(instanceId，不随 IP 变化): ${identityOk ? '✅' : '❌'} (A=${aId})`);
 
     // B 侧收集消息
     const received = { texts: [], chunks: new Map(), fileMeta: null, fromIds: new Set() };
@@ -102,7 +109,7 @@ async function main() {
     a.stop();
     fs.unlinkSync(tmpFile);
 
-    const allOk = textOk && fromOk && chunksOk && contentOk && progressOk && reverseOk && offlineOk;
+    const allOk = identityOk && textOk && fromOk && chunksOk && contentOk && progressOk && reverseOk && offlineOk;
     console.log(allOk ? '\n全部通过 ✅' : '\n存在失败项 ❌');
     process.exit(allOk ? 0 : 1);
 }

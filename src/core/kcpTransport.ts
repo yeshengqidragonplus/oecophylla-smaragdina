@@ -12,8 +12,9 @@ import { log, logError } from './logger';
  *
  * 数据报格式（第 1 字节区分类型）：
  * - 0x01 控制报文：JSON，用于会话握手与关闭
- *   - {"t":"syn","conv":<n>,"id":"<发起方 peerId>","boot":"<发起方启动标识>"}  建连请求（发起方选随机 conv）
- *   - {"t":"ack","conv":<n>,"id":"<应答方 peerId>","boot":"<应答方启动标识>"}  建连确认
+ *   - {"t":"syn","conv":<n>,"id":"<发起方旧版 peerId>","iid":"<发起方实例 ID>","boot":"<启动标识>","mp":<主端口>}  建连请求（发起方选随机 conv）
+ *   - {"t":"ack","conv":<n>,"id":"<应答方旧版 peerId>","iid":"<应答方实例 ID>","boot":"<启动标识>","mp":<主端口>}  建连确认
+ *   会话以实例 ID（iid）为键；旧版对端没有 iid，退回使用 id（ip:端口）。
  *   - {"t":"fin","conv":<n>}   会话关闭
  *   - {"t":"rst","conv":<n>}   "我没有这个会话"：收到未知 conv 的 KCP 报文时回复，让对端立刻销毁僵尸会话
  * - 0x02 KCP 报文：原始 KCP 段，conv 标识会话
@@ -31,7 +32,7 @@ import { log, logError } from './logger';
  *
  * 事件（与 TcpTransport 一致）：
  * - 'data' (peerId, Buffer)      收到一条完整业务消息
- * - 'sessionConnected' (peerId)  入站会话握手完成
+ * - 'sessionConnected' (peerId, SessionPeerInfo)  入站会话握手完成
  * - 'sessionClosed' (peerId)     会话关闭
  * - 'sessionError' (peerId, err) 会话错误（如链路死亡）
  * - 'transportError' (err, target?) socket 级错误（发送失败、权限被拒等）。
@@ -77,7 +78,23 @@ export function isRetryableKcpError(err: unknown): boolean {
 interface ControlMessage {
     t: 'syn' | 'ack' | 'fin' | 'rst';
     conv?: number;
+    /** 旧版 peerId（ip:端口），仅为兼容旧版对端 */
     id?: string;
+    /** 实例 ID：新版对端的稳定身份 */
+    iid?: string;
+    boot?: string;
+    /** 发送方的主 UDP 端口（KCP 端口 = 主端口 + 1000） */
+    mp?: number;
+}
+
+/** 入站会话建立时上报的对端信息 */
+export interface SessionPeerInfo {
+    ip: string;
+    /** 对端主 UDP 端口 */
+    port: number;
+    /** 对端 KCP 端口 */
+    transferPort: number;
+    iid?: string;
     boot?: string;
 }
 
@@ -101,8 +118,10 @@ interface KcpSession {
 export class KcpTransport extends events.EventEmitter {
     private _socket: dgram.Socket | null = null;
     private _port: number;
-    /** 本端 peerId（`ip:主端口`），用于握手身份和双向建连仲裁 */
+    /** 本端旧版 peerId（`ip:主端口`），仅为兼容旧版对端 */
     private _localId: string = '';
+    /** 本端实例 ID：新版握手的身份与双向建连仲裁依据 */
+    private _localInstanceId: string = '';
     /** 本进程本次启动的随机标识，随握手发出；对端据此识别"我重启过" */
     private readonly _boot: string = crypto.randomBytes(4).toString('hex');
     /** key: peerId -> session */
@@ -139,6 +158,25 @@ export class KcpTransport extends events.EventEmitter {
 
     setLocalId(id: string): void {
         this._localId = id;
+    }
+
+    setLocalInstanceId(iid: string): void {
+        this._localInstanceId = iid;
+    }
+
+    /** 握手与仲裁中本端的身份：优先实例 ID */
+    private _localKey(): string {
+        return this._localInstanceId || this._localId;
+    }
+
+    /** 握手报文里携带的本端身份 */
+    private _identity(): Pick<ControlMessage, 'id' | 'iid' | 'boot' | 'mp'> {
+        return {
+            id: this._localId,
+            iid: this._localInstanceId || undefined,
+            boot: this._boot,
+            mp: this._port - 1000
+        };
     }
 
     /**
@@ -235,12 +273,12 @@ export class KcpTransport extends events.EventEmitter {
         return new Promise((resolve, reject) => {
             // 随机 32 位 conv；同对 peer 碰撞概率可忽略
             const conv = (Math.floor(Math.random() * 0xfffffffe) + 1) >>> 0;
-            const session = this._createSession(peerId, host, port, conv, this._localId);
+            const session = this._createSession(peerId, host, port, conv, this._localKey());
             this._sessions.set(peerId, session);
             this._convIndex.set(conv, session);
 
             log(`[KCP] 发起握手 → ${peerId}（${host}:${port}，conv=${conv}）`);
-            const syn: ControlMessage = { t: 'syn', conv, id: this._localId, boot: this._boot };
+            const syn: ControlMessage = { t: 'syn', conv, ...this._identity() };
             this._sendControl(host, port, syn);
             let synCount = 1;
             const retryTimer = setInterval(() => {
@@ -394,10 +432,10 @@ export class KcpTransport extends events.EventEmitter {
 
     /** 入站建连请求 */
     private _handleSyn(ctrl: ControlMessage, rinfo: dgram.RemoteInfo): void {
-        if (!ctrl.id || typeof ctrl.conv !== 'number' || ctrl.conv === 0) {
+        const peerId = ctrl.iid || ctrl.id;
+        if (!peerId || typeof ctrl.conv !== 'number' || ctrl.conv === 0) {
             return;
         }
-        const peerId = ctrl.id;
         const conv = ctrl.conv >>> 0;
         const remoteBoot = typeof ctrl.boot === 'string' ? ctrl.boot : undefined;
         const existing = this._sessions.get(peerId);
@@ -405,7 +443,7 @@ export class KcpTransport extends events.EventEmitter {
         if (existing) {
             if (existing.conv === conv) {
                 // SYN 重发：幂等地再次确认
-                this._sendControl(rinfo.address, rinfo.port, { t: 'ack', conv, id: this._localId, boot: this._boot });
+                this._sendControl(rinfo.address, rinfo.port, { t: 'ack', conv, ...this._identity() });
                 return;
             }
 
@@ -436,9 +474,16 @@ export class KcpTransport extends events.EventEmitter {
         session.established = true;
         this._sessions.set(peerId, session);
         this._convIndex.set(conv, session);
-        this._sendControl(rinfo.address, rinfo.port, { t: 'ack', conv, id: this._localId, boot: this._boot });
+        this._sendControl(rinfo.address, rinfo.port, { t: 'ack', conv, ...this._identity() });
         log(`KCP inbound session established: ${peerId}`);
-        this.emit('sessionConnected', peerId);
+        const info: SessionPeerInfo = {
+            ip: rinfo.address,
+            port: typeof ctrl.mp === 'number' ? ctrl.mp : rinfo.port - 1000,
+            transferPort: rinfo.port,
+            iid: ctrl.iid,
+            boot: remoteBoot
+        };
+        this.emit('sessionConnected', peerId, info);
         this.emit('_established', peerId);
     }
 

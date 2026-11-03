@@ -1,11 +1,37 @@
+import * as crypto from 'crypto';
 import * as vscode from 'vscode';
-import { networkService } from './core/networkService';
+import { StartOptions, networkService } from './core/networkService';
+import { getBuildHash } from './core/buildInfo';
 import { PeersManager } from './peersManager';
 import { logError } from './core/logger';
 
+const MACHINE_ID_KEY = 'oschat.machineId';
 const MIN_PORT = 1024;
 /** 业务端口 = 主端口 + 1000，必须不超过 65535 */
 const MAX_PORT = 64535;
+
+/** 随发现与握手携带的本机标识与版本信息，由 initNetworkIdentity 在激活时准备 */
+let identity: StartOptions = {};
+
+/**
+ * 准备本机的稳定标识：首次运行生成并保存到全局状态，之后一直不变，
+ * 对端据此识别"这还是同一台机器"，DHCP 换 IP 不会再被当成新联系人。
+ */
+export function initNetworkIdentity(context: vscode.ExtensionContext): void {
+    let machineId = context.globalState.get<string>(MACHINE_ID_KEY);
+    if (!machineId) {
+        machineId = crypto.randomUUID();
+        void context.globalState.update(MACHINE_ID_KEY, machineId);
+    }
+    identity = {
+        machineId,
+        meta: {
+            version: context.extension.packageJSON.version as string,
+            build: getBuildHash(),
+            vscode: vscode.version
+        }
+    };
+}
 
 /**
  * 读取最新配置并启动（或重启）网络服务。
@@ -14,7 +40,7 @@ const MAX_PORT = 64535;
  *
  * @returns 是否启动成功（失败原因已通过消息提示给用户）
  */
-export async function startNetworkFromConfig(peersManager: PeersManager): Promise<boolean> {
+export async function startNetworkFromConfig(_peersManager?: PeersManager): Promise<boolean> {
     const config = vscode.workspace.getConfiguration('oschat');
     const port = config.get<number>('port', 8080);
     const nickname = config.get<string>('nickname', '');
@@ -27,7 +53,7 @@ export async function startNetworkFromConfig(peersManager: PeersManager): Promis
     }
 
     try {
-        await networkService.start(port, nickname, peersManager.getPeersFilePath());
+        await networkService.start(port, nickname, identity);
         vscode.window.showInformationMessage(`网络服务已启动，监听端口 ${port}`);
         return true;
     } catch (error) {

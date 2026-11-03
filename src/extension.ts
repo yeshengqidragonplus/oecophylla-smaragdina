@@ -4,7 +4,7 @@ import { SettingsPanel } from './settingsPanel';
 import { PeersManager } from './peersManager';
 import { networkService } from './core/networkService';
 import { PeersEditor } from './peersEditor';
-import { startNetworkFromConfig, stopNetwork } from './networkLauncher';
+import { initNetworkIdentity, startNetworkFromConfig, stopNetwork } from './networkLauncher';
 import { setLogSink, log } from './core/logger';
 import { getBuildHash } from './core/buildInfo';
 
@@ -22,6 +22,9 @@ export function activate(context: vscode.ExtensionContext) {
         })
     );
     log(`OSChat 激活，插件版本 ${context.extension.packageJSON.version}，构建 ${getBuildHash()}，传输层 UDP+KCP`);
+
+    // 本机稳定标识与版本信息（随发现与握手发出）
+    initNetworkIdentity(context);
 
     // 初始化 PeersManager
     peersManager = new PeersManager(context);
@@ -47,22 +50,6 @@ export function activate(context: vscode.ExtensionContext) {
             }
         })
     );
-
-    // 监听网络服务的 peer 更新事件
-    networkService.on('peersUpdate', (peers: import('./core/networkService').PeerInfo[]) => {
-        peers.forEach((peer: import('./core/networkService').PeerInfo) => {
-            peersManager.updatePeer({
-                id: peer.id,
-                hostname: peer.hostname,
-                nickname: peer.nickname,
-                ip: peer.ip,
-                port: peer.port,
-                lastSeen: peer.lastSeen,
-                status: peer.status
-            });
-        });
-        chatProvider.refresh();
-    });
 
     // 自动启动网络服务（读取最新配置，不阻塞激活）
     if (vscode.workspace.getConfiguration('oschat').get<boolean>('autoConnect', true)) {
