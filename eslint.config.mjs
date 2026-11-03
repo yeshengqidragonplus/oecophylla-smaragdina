@@ -2,7 +2,7 @@ import typescriptEslint from "typescript-eslint";
 import { fileURLToPath } from "node:url";
 
 export default [{
-    files: ["**/*.ts"],
+    files: ["**/*.ts", "**/*.tsx"],
 }, {
     plugins: {
         "@typescript-eslint": typescriptEslint.plugin,
