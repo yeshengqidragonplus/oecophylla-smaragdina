@@ -3,10 +3,15 @@ const fs = require('fs');
 const path = require('path');
 const os = require('os');
 const { NetworkService } = require('./out/core/networkService');
+const { FileReceiver } = require('./out/core/fileReceiver');
+const { FileReceiveService } = require('./out/core/fileReceiveService');
 
 async function main() {
     const a = new NetworkService();
     const b = new NetworkService();
+    // B 接上真实的接收链路：流式写盘 + 落盘后回 file_ack（与扩展里的接线一致）
+    const recvDir = fs.mkdtempSync(path.join(os.tmpdir(), 'oschat-smoke-recv-'));
+    const receiveService = new FileReceiveService(b, new FileReceiver({ resolveDir: () => recvDir }));
 
     // 准备一个 200KB 的测试文件（跨多个 64KB 块）
     const tmpFile = path.join(os.tmpdir(), 'oschat-smoke-src.bin');
@@ -42,14 +47,10 @@ async function main() {
     console.log(`稳定身份(instanceId，不随 IP 变化): ${identityOk ? '✅' : '❌'} (A=${aId})`);
 
     // B 侧收集消息
-    const received = { texts: [], chunks: new Map(), fileMeta: null, fromIds: new Set() };
+    const received = { texts: [], fromIds: new Set() };
     b.on('message', msg => {
         received.fromIds.add(msg.from);
         if (msg.type === 'message') { received.texts.push(msg.content); }
-        if (msg.type === 'file') {
-            received.fileMeta = { name: msg.file.name, size: msg.file.size, totalChunks: msg.file.totalChunks };
-            received.chunks.set(msg.file.chunkIndex, msg.file.data);
-        }
     });
 
     // A → B：一条消息 + 一个文件
@@ -68,18 +69,14 @@ async function main() {
     const fromOk = received.fromIds.size === 1 && received.fromIds.has(aId);
     console.log(`消息来源身份(peerId): ${fromOk ? '✅' : '❌'} (${[...received.fromIds]})`);
 
-    const meta = received.fileMeta;
-    const chunksOk = meta && received.chunks.size === meta.totalChunks && meta.totalChunks === Math.ceil(payload.length / (64 * 1024));
-    console.log(`分块数: ${chunksOk ? '✅' : '❌'} (收到 ${received.chunks.size}/${meta && meta.totalChunks})`);
-
-    let assembled = Buffer.alloc(0);
-    if (meta) {
-        const parts = [];
-        for (let i = 0; i < meta.totalChunks; i++) { parts.push(Buffer.from(received.chunks.get(i), 'base64')); }
-        assembled = Buffer.concat(parts);
-    }
-    const contentOk = assembled.equals(payload);
-    console.log(`文件内容一致: ${contentOk ? '✅' : '❌'} (${assembled.length}/${payload.length} 字节)`);
+    // 文件由接收端流式写盘，并在落盘后回了 file_ack（发送端 executeTransferTask 已等到确认才返回）
+    const savedPath = path.join(recvDir, 'smoke.bin');
+    const saved = fs.existsSync(savedPath) ? fs.readFileSync(savedPath) : Buffer.alloc(0);
+    const contentOk = saved.equals(payload);
+    console.log(`文件落盘且内容一致: ${contentOk ? '✅' : '❌'} (${saved.length}/${payload.length} 字节)`);
+    const noPartLeft = fs.readdirSync(recvDir).every(n => !n.endsWith('.part'));
+    console.log(`无残留临时文件: ${noPartLeft ? '✅' : '❌'}`);
+    const chunksOk = noPartLeft;
 
     const progressOk = progressValues.length > 2 && progressValues[progressValues.length - 1] === 100;
     console.log(`真实进度更新: ${progressOk ? '✅' : '❌'} (${progressValues.length} 次更新, 末值 ${progressValues[progressValues.length - 1]})`);
@@ -107,6 +104,8 @@ async function main() {
     if (!offlineOk) { console.log('离线快速失败: ❌ 发送竟然成功了'); }
 
     a.stop();
+    receiveService.dispose();
+    fs.rmSync(recvDir, { recursive: true, force: true });
     fs.unlinkSync(tmpFile);
 
     const allOk = identityOk && textOk && fromOk && chunksOk && contentOk && progressOk && reverseOk && offlineOk;
