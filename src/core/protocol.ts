@@ -8,8 +8,14 @@ import { PeerMeta } from './peerRegistry';
  * （防止畸形数据、超大 totalChunks/size 撑爆内存）。
  */
 
-/** 线上协议版本：2 = 实例 ID / boot / meta */
-export const PROTOCOL_VERSION = 2;
+/**
+ * 线上协议版本：
+ * - 2：实例 ID / boot / meta；
+ * - 3：文件传输带 transferId / chunkSize，发送端以 file_end 收尾，接收端以 file_ack 确认落盘结果。
+ */
+export const PROTOCOL_VERSION = 3;
+/** 支持文件落盘确认（file_end / file_ack）的最低协议版本 */
+export const FILE_ACK_MIN_PROTO = 3;
 
 /** 文件分块大小（原始字节，发送时转 base64） */
 export const FILE_CHUNK_SIZE = 64 * 1024;
@@ -68,7 +74,24 @@ export interface FileChunkMessage extends FrameBase {
     };
 }
 
-export type BusinessMessage = TextMessage | FileChunkMessage;
+/** KCP 通道：文件发送完毕（所有分块都已被对端传输层确认），请接收端核对并回应 */
+export interface FileEndMessage extends FrameBase {
+    type: 'file_end';
+    transferId: string;
+    name: string;
+    size: number;
+    totalChunks: number;
+}
+
+/** KCP 通道：接收端对一个文件落盘结果的确认 */
+export interface FileAckMessage extends FrameBase {
+    type: 'file_ack';
+    transferId: string;
+    ok: boolean;
+    reason?: string;
+}
+
+export type BusinessMessage = TextMessage | FileChunkMessage | FileEndMessage | FileAckMessage;
 
 export type NetworkMessage = PresenceMessage | BusinessMessage;
 
@@ -242,6 +265,27 @@ export function parseBusinessFrame(input: Buffer | string): ParseResult<Business
                 }
             }
         };
+    }
+
+    if (raw.type === 'file_end') {
+        const name = optionalString(raw.name, MAX_NAME_LENGTH);
+        if (typeof raw.transferId !== 'string' || raw.transferId.length === 0 || raw.transferId.length > MAX_ID_LENGTH
+            || !name || !isIntegerIn(raw.size, 0, MAX_FILE_SIZE) || !isIntegerIn(raw.totalChunks, 1, MAX_FILE_SIZE / MIN_CHUNK_SIZE)) {
+            return { ok: false, reason: 'file_end 字段缺失或非法' };
+        }
+        return {
+            ok: true,
+            msg: { ...base, type: 'file_end', transferId: raw.transferId, name, size: raw.size, totalChunks: raw.totalChunks }
+        };
+    }
+
+    if (raw.type === 'file_ack') {
+        const reason = optionalString(raw.reason, 500);
+        if (typeof raw.transferId !== 'string' || raw.transferId.length === 0 || raw.transferId.length > MAX_ID_LENGTH
+            || typeof raw.ok !== 'boolean' || reason === null) {
+            return { ok: false, reason: 'file_ack 字段缺失或非法' };
+        }
+        return { ok: true, msg: { ...base, type: 'file_ack', transferId: raw.transferId, ok: raw.ok, reason } };
     }
 
     return { ok: false, reason: `未知的业务消息类型（type=${String(raw.type)}）` };

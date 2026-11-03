@@ -96,3 +96,23 @@ suite('protocol：KCP 业务帧校验', () => {
         assert.ok(!parseBusinessFrame('{').ok);
     });
 });
+
+suite('protocol：文件收尾与落盘确认', () => {
+    test('合法的 file_end 与 file_ack', () => {
+        const end = parseBusinessFrame(json({ type: 'file_end', transferId: 't1', name: 'a.bin', size: 10, totalChunks: 1 }));
+        assert.ok(end.ok && end.msg.type === 'file_end' && end.msg.transferId === 't1');
+        const ok = parseBusinessFrame(json({ type: 'file_ack', transferId: 't1', ok: true }));
+        assert.ok(ok.ok && ok.msg.type === 'file_ack' && ok.msg.ok === true);
+        const fail = parseBusinessFrame(json({ type: 'file_ack', transferId: 't1', ok: false, reason: '磁盘空间不足' }));
+        assert.ok(fail.ok && fail.msg.type === 'file_ack' && fail.msg.reason === '磁盘空间不足');
+    });
+
+    test('file_end / file_ack 字段缺失或非法被拒绝', () => {
+        assert.ok(!parseBusinessFrame(json({ type: 'file_end', name: 'a', size: 1, totalChunks: 1 })).ok);
+        assert.ok(!parseBusinessFrame(json({ type: 'file_end', transferId: 't', name: 'a', size: -1, totalChunks: 1 })).ok);
+        assert.ok(!parseBusinessFrame(json({ type: 'file_end', transferId: 't', name: 'a', size: 1, totalChunks: 0 })).ok);
+        assert.ok(!parseBusinessFrame(json({ type: 'file_ack', transferId: 't', ok: 'yes' })).ok);
+        assert.ok(!parseBusinessFrame(json({ type: 'file_ack', transferId: '', ok: true })).ok);
+        assert.ok(!parseBusinessFrame(json({ type: 'file_ack', transferId: 't', ok: false, reason: 'x'.repeat(501) })).ok);
+    });
+});

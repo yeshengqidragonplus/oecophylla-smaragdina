@@ -19,8 +19,11 @@ import { ProbeState, isClockJump, isProbeDue, nextProbeState } from './probeSche
 import { PeerMeta, PeerRecord, PeerRegistry, Presence } from './peerRegistry';
 import {
     BusinessMessage,
+    FILE_ACK_MIN_PROTO,
     FILE_CHUNK_SIZE,
+    FileAckMessage,
     FileChunkMessage,
+    FileEndMessage,
     PROTOCOL_VERSION,
     PresenceMessage,
     PresenceType,
@@ -31,7 +34,7 @@ import {
 import { TypedEmitter } from './typedEmitter';
 
 // 协议类型集中定义在 protocol.ts，这里重新导出，保持原有的 import 路径可用
-export type { BusinessMessage, FileChunkMessage, NetworkMessage, PresenceMessage, TextMessage } from './protocol';
+export type { BusinessMessage, FileAckMessage, FileChunkMessage, FileEndMessage, NetworkMessage, PresenceMessage, TextMessage } from './protocol';
 export { PROTOCOL_VERSION } from './protocol';
 
 export interface PeerInfo {
@@ -96,7 +99,7 @@ export interface TransferTask {
     peerPort: number;
     messages: string[];
     files: { name: string; path: string; size: number }[];
-    status: 'pending' | 'connecting' | 'transferring' | 'completed' | 'failed' | 'timeout';
+    status: 'pending' | 'connecting' | 'transferring' | 'completed' | 'failed' | 'timeout' | 'cancelled';
     progress: number;
     totalBytes: number;
     transferredBytes: number;
@@ -119,11 +122,31 @@ const DISCOVERY_QUICK_DELAYS = [1_000, 3_000];
 const DISCOVERY_PORT = 41320;
 /** KCP 握手建连超时（毫秒） */
 const CONNECT_TIMEOUT = 5_000;
+/** 文件发送：同时在途的分块数（流水线深度）。逐块等 ACK 时吞吐 ≈ 64KB/RTT，Wi-Fi 上明显偏慢 */
+const FILE_SEND_WINDOW = 8;
+/** 文件发送完毕后等待接收端落盘确认（file_ack）的最长时间 */
+const FILE_ACK_TIMEOUT = 30_000;
+/** 已结束的传输任务保留多久后清理（避免任务表无限增长） */
+const FINISHED_TASK_TTL = 10 * 60 * 1000;
 /** 手动扫描网段：单个网段最多探测的主机数（/22 为 1022；更大的网段不扫） */
 const SCAN_HOST_LIMIT = 1022;
 /** 手动扫描网段：每批探测的主机数与批间间隔，避免瞬间发出上千个包 */
 const SCAN_BATCH_SIZE = 64;
 const SCAN_BATCH_DELAY = 20;
+
+/** 读取待发送文件失败时的可读提示（Windows 下被其他程序独占的文件很常见） */
+function describeOpenError(fileName: string, err: unknown): string {
+    switch ((err as NodeJS.ErrnoException).code) {
+        case 'EBUSY':
+        case 'EPERM':
+        case 'EACCES':
+            return `无法读取文件「${fileName}」：文件被其他程序占用，或没有读取权限（请先关闭占用它的程序，如已打开的 Excel）`;
+        case 'ENOENT':
+            return `文件「${fileName}」已被移动或删除`;
+        default:
+            return `无法读取文件「${fileName}」：${(err as Error).message}`;
+    }
+}
 
 export class NetworkService extends TypedEmitter<NetworkServiceEvents> {
     private _udpServer: dgram.Socket | null = null;
@@ -144,6 +167,10 @@ export class NetworkService extends TypedEmitter<NetworkServiceEvents> {
     private _state: NetworkStatus['state'] = 'stopped';
     private _stateError: string | undefined;
     private _scanning: boolean = false;
+    /** 已请求取消的任务 id */
+    private _cancelled: Set<string> = new Set();
+    /** 等待接收端落盘确认的发送：key 为 transferId */
+    private _ackWaiters: Map<string, { result?: FileAckMessage; resolve?: (ack: FileAckMessage) => void }> = new Map();
     private _isRunning: boolean = false;
     private _transferTasks: Map<string, TransferTask> = new Map();
     private _transport: KcpTransport | null = null;
@@ -501,6 +528,15 @@ export class NetworkService extends TypedEmitter<NetworkServiceEvents> {
             }
             const msg = parsed.msg;
             msg.from = peerId;
+            if (msg.type === 'file_ack') {
+                // 落盘确认只交给等待它的发送流程，不作为聊天消息上报
+                const waiter = this._ackWaiters.get(msg.transferId);
+                if (waiter) {
+                    waiter.result = msg;
+                    waiter.resolve?.(msg);
+                }
+                return;
+            }
             if (msg.type === 'message' && msg.id && this._isDuplicateMessage(msg.id)) {
                 log(`[消息] 忽略重复消息 ${msg.id}（会话重建后的重发）`);
                 return;
@@ -756,9 +792,32 @@ export class NetworkService extends TypedEmitter<NetworkServiceEvents> {
             createdAt: Date.now()
         };
 
+        this._pruneFinishedTasks();
         this._transferTasks.set(taskId, task);
         this.emit('transferTaskCreated', task);
         return task;
+    }
+
+    /** 清理已结束超过 10 分钟的任务（_transferTasks 原先只增不删） */
+    private _pruneFinishedTasks(): void {
+        const now = Date.now();
+        for (const [id, task] of this._transferTasks) {
+            const finished = task.status === 'completed' || task.status === 'failed'
+                || task.status === 'timeout' || task.status === 'cancelled';
+            if (finished && now - (task.completedAt ?? task.createdAt) > FINISHED_TASK_TTL) {
+                this._transferTasks.delete(id);
+            }
+        }
+    }
+
+    /** 取消传输任务：停止继续发送；已发出的分块无法收回，接收端会在超时后清理残留的临时文件 */
+    public cancelTransferTask(taskId: string): boolean {
+        const task = this._transferTasks.get(taskId);
+        if (!task || task.status === 'completed' || task.status === 'failed' || task.status === 'timeout' || task.status === 'cancelled') {
+            return false;
+        }
+        this._cancelled.add(taskId);
+        return true;
     }
 
     /**
@@ -815,27 +874,53 @@ export class NetworkService extends TypedEmitter<NetworkServiceEvents> {
             this.emit('transferTaskUpdated', task);
             this.emit('transferTaskCompleted', task);
         } catch (err) {
-            logError(`[传输] 任务 ${taskId} 失败: ${(err as Error).message}`);
-            task.status = 'failed';
-            task.errorMessage = (err as Error).message;
+            const cancelled = this._cancelled.has(taskId);
+            logError(`[传输] 任务 ${taskId} ${cancelled ? '已取消' : '失败'}: ${(err as Error).message}`);
+            task.status = cancelled ? 'cancelled' : 'failed';
+            task.errorMessage = cancelled ? '已取消' : (err as Error).message;
+            task.completedAt = Date.now();
             this.emit('transferTaskUpdated', task);
             this.emit('transferTaskFailed', task);
             throw err;
+        } finally {
+            this._cancelled.delete(taskId);
         }
     }
 
     /**
-     * 分块流式发送文件：从磁盘按块读取，逐块发送并更新真实进度，
-     * 避免整个文件驻留内存。
+     * 分块流式发送文件：从磁盘按块读取，滑动窗口并发发送（最多 8 块在途），按真实已确认字节更新进度，
+     * 避免整个文件驻留内存。接收端按偏移写盘，分块到达顺序不影响结果。
+     *
+     * 协议 v3 对端：每个文件带 transferId，全部分块被传输层确认后发 file_end，并等待接收端的 file_ack
+     * （落盘成功才算成功）——传输层确认只说明"对端收到了"，不说明"对端存下来了"。
+     * 旧版对端不会回 file_ack，保持原行为（传输层确认即视为成功）。
      */
     private async _sendFileChunked(task: TransferTask, file: { name: string; path: string; size: number }): Promise<void> {
         const totalChunks = Math.max(1, Math.ceil(file.size / FILE_CHUNK_SIZE));
-        const handle = await fs.promises.open(file.path, 'r');
+        const transferId = crypto.randomUUID();
+        const peer = this._resolvePeer(task.peerId);
+        const expectAck = (peer.proto ?? 0) >= FILE_ACK_MIN_PROTO;
+        // 先登记等待：接收端可能在我们发出 file_end 之前就已收齐并回了 file_ack
+        const ackWaiter = expectAck ? this._expectFileAck(transferId) : undefined;
+
+        let handle: fs.promises.FileHandle;
+        try {
+            handle = await fs.promises.open(file.path, 'r');
+        } catch (err) {
+            ackWaiter?.cancel();
+            throw new Error(describeOpenError(file.name, err));
+        }
+
         let lastProgress = -1;
+        let firstError: Error | null = null;
+        const inflight: Promise<void>[] = [];
 
         try {
             const chunkBuffer = Buffer.allocUnsafe(FILE_CHUNK_SIZE);
-            for (let chunkIndex = 0; chunkIndex < totalChunks; chunkIndex++) {
+            for (let chunkIndex = 0; chunkIndex < totalChunks && !firstError; chunkIndex++) {
+                if (this._cancelled.has(task.id)) {
+                    throw new Error('已取消');
+                }
                 const { bytesRead } = await handle.read(chunkBuffer, 0, FILE_CHUNK_SIZE, chunkIndex * FILE_CHUNK_SIZE);
 
                 const msg: FileChunkMessage = {
@@ -848,24 +933,81 @@ export class NetworkService extends TypedEmitter<NetworkServiceEvents> {
                         size: file.size,
                         chunkIndex,
                         totalChunks,
-                        data: chunkBuffer.subarray(0, bytesRead).toString('base64')
+                        // base64 立即生成字符串副本，之后复用同一个读缓冲区是安全的
+                        data: chunkBuffer.subarray(0, bytesRead).toString('base64'),
+                        chunkSize: FILE_CHUNK_SIZE,
+                        transferId
                     }
                 };
-                await this._sendViaTransport(task.peerId, msg);
+                const send = this._sendViaTransport(task.peerId, msg).then(() => {
+                    task.transferredBytes += bytesRead;
+                    const progress = task.totalBytes > 0
+                        ? Math.floor((task.transferredBytes / task.totalBytes) * 100)
+                        : 100;
+                    if (progress !== lastProgress) {
+                        lastProgress = progress;
+                        task.progress = progress;
+                        this.emit('transferTaskUpdated', task);
+                    }
+                }).catch((err: Error) => {
+                    firstError = firstError ?? err;
+                });
+                inflight.push(send);
+                if (inflight.length >= FILE_SEND_WINDOW) {
+                    await inflight.shift();
+                }
+            }
+            await Promise.all(inflight);
+            if (firstError) {
+                throw firstError;
+            }
 
-                task.transferredBytes += bytesRead;
-                const progress = task.totalBytes > 0
-                    ? Math.floor((task.transferredBytes / task.totalBytes) * 100)
-                    : 100;
-                if (progress !== lastProgress) {
-                    lastProgress = progress;
-                    task.progress = progress;
-                    this.emit('transferTaskUpdated', task);
+            if (ackWaiter) {
+                const end: FileEndMessage = {
+                    type: 'file_end',
+                    from: this._localPeerId(),
+                    to: task.peerId,
+                    timestamp: Date.now(),
+                    transferId,
+                    name: file.name,
+                    size: file.size,
+                    totalChunks
+                };
+                await this._sendViaTransport(task.peerId, end);
+                const ack = await ackWaiter.wait(FILE_ACK_TIMEOUT);
+                if (!ack.ok) {
+                    throw new Error(`对方没有成功保存「${file.name}」：${ack.reason ?? '未知原因'}`);
                 }
             }
         } finally {
+            ackWaiter?.cancel();
             await handle.close();
         }
+    }
+
+    /** 登记对一个文件的落盘确认；wait 在确认到达（含早于 wait 调用到达的）或超时时结束 */
+    private _expectFileAck(transferId: string): { wait(timeoutMs: number): Promise<FileAckMessage>; cancel(): void } {
+        const entry: { result?: FileAckMessage; resolve?: (ack: FileAckMessage) => void } = {};
+        this._ackWaiters.set(transferId, entry);
+        return {
+            wait: (timeoutMs: number) => new Promise<FileAckMessage>((resolve, reject) => {
+                if (entry.result) {
+                    resolve(entry.result);
+                    return;
+                }
+                const timer = setTimeout(() => {
+                    entry.resolve = undefined;
+                    reject(new Error('对方没有确认已保存文件（可能中途已重启或断开）'));
+                }, timeoutMs);
+                entry.resolve = ack => {
+                    clearTimeout(timer);
+                    resolve(ack);
+                };
+            }),
+            cancel: () => {
+                this._ackWaiters.delete(transferId);
+            }
+        };
     }
 
     /**

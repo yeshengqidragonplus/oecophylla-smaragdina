@@ -2,7 +2,7 @@ import * as crypto from 'crypto';
 import * as fs from 'fs';
 import * as path from 'path';
 import { log, logError } from './logger';
-import { FILE_CHUNK_SIZE, FileChunkMessage } from './protocol';
+import { FILE_CHUNK_SIZE, FileChunkMessage, FileEndMessage } from './protocol';
 import { sanitizeFileName, uniqueSavePath } from './safeFileName';
 import { TypedEmitter } from './typedEmitter';
 
@@ -26,7 +26,12 @@ export interface IncomingFileInfo {
     peerId: string;
     fileName: string;
     size: number;
+    /** 旧版发送方（没有 transferId、不会等待落盘确认）：接收完成后不必回 file_ack */
+    legacy: boolean;
 }
+
+/** file_end 到达时接收端对该传输的状态 */
+export type EndState = 'completed' | 'failed' | 'pending' | 'unknown';
 
 export interface FileReceiverEvents {
     started: [info: IncomingFileInfo];
@@ -52,6 +57,8 @@ const DEFAULT_PROGRESS_INTERVAL = 200;
 /** 同时进行的接收上限（每个占一个文件句柄） */
 const MAX_ACTIVE_TRANSFERS = 16;
 const STALE_PART_PATTERN = /\.[0-9a-f]{8}\.part$/;
+/** 记住最近传输的结果，供迟到的 file_end 幂等应答 */
+const MAX_REMEMBERED_RESULTS = 256;
 
 interface Transfer {
     key: string;
@@ -91,6 +98,7 @@ function describeFsError(err: unknown): string {
 
 export class FileReceiver extends TypedEmitter<FileReceiverEvents> {
     private _transfers: Map<string, Transfer> = new Map();
+    private _results: Map<string, { ok: boolean; reason?: string }> = new Map();
     private _pending: Set<Promise<void>> = new Set();
     private _sweepTimer: NodeJS.Timeout | null = null;
 
@@ -145,6 +153,37 @@ export class FileReceiver extends TypedEmitter<FileReceiverEvents> {
         this._track(work);
     }
 
+    /**
+     * 发送方声明"该文件已全部发出"：返回接收端对该传输的状态，由上层决定是否立即回 file_ack。
+     * - completed / failed：已有结果，立即应答；
+     * - pending：写盘还在进行，完成时会触发 completed / failed 事件再应答；
+     * - unknown：从未收到过该传输的数据（接收端重启过、分块全部丢失），应立即回失败让发送方快速失败。
+     */
+    handleEnd(peerId: string, msg: FileEndMessage): { state: EndState; reason?: string } {
+        const key = `${peerId}|${msg.transferId}`;
+        if (this._transfers.has(key)) {
+            return { state: 'pending' };
+        }
+        const result = this._results.get(key);
+        if (result) {
+            return { state: result.ok ? 'completed' : 'failed', reason: result.reason };
+        }
+        return { state: 'unknown' };
+    }
+
+    private _remember(transfer: Transfer, ok: boolean, reason?: string): void {
+        if (transfer.info.legacy) {
+            return;
+        }
+        this._results.set(`${transfer.info.peerId}|${transfer.info.transferId}`, { ok, reason });
+        if (this._results.size > MAX_REMEMBERED_RESULTS) {
+            const oldest = this._results.keys().next().value;
+            if (oldest !== undefined) {
+                this._results.delete(oldest);
+            }
+        }
+    }
+
     /** 停止：中止所有进行中的接收并清理临时文件 */
     dispose(): void {
         if (this._sweepTimer) {
@@ -167,6 +206,7 @@ export class FileReceiver extends TypedEmitter<FileReceiverEvents> {
         key: string, peerId: string, fileName: string, size: number,
         totalChunks: number, chunkSize: number, transferId?: string
     ): Transfer {
+        const legacy = transferId === undefined;
         const id = transferId ?? `legacy-${crypto.createHash('sha1').update(key).digest('hex').slice(0, 8)}`;
         const dir = this._options.resolveDir();
         const shortId = crypto.randomBytes(4).toString('hex');
@@ -174,7 +214,7 @@ export class FileReceiver extends TypedEmitter<FileReceiverEvents> {
         const safe = sanitizeFileName(fileName, 120);
         const transfer: Transfer = {
             key,
-            info: { transferId: id, peerId, fileName, size },
+            info: { transferId: id, peerId, fileName, size, legacy },
             totalChunks,
             chunkSize,
             received: new Set(),
@@ -267,11 +307,14 @@ export class FileReceiver extends TypedEmitter<FileReceiverEvents> {
             }
             const savedPath = await this._moveIntoPlace(transfer);
             log(`[接收] 已保存 ${savedPath}`);
+            this._remember(transfer, true);
             this.emit('completed', { ...transfer.info, savedPath });
         } catch (err) {
             logError(`[接收] ${transfer.info.fileName} 收尾失败:`, (err as Error).message);
             await fs.promises.unlink(transfer.partPath).catch(() => undefined);
-            this.emit('failed', { ...transfer.info, reason: describeFsError(err) });
+            const reason = describeFsError(err);
+            this._remember(transfer, false, reason);
+            this.emit('failed', { ...transfer.info, reason });
         }
     }
 
@@ -313,6 +356,7 @@ export class FileReceiver extends TypedEmitter<FileReceiverEvents> {
             await fs.promises.unlink(transfer.partPath).catch(() => undefined);
         })();
         this._track(cleanup);
+        this._remember(transfer, false, reason);
         this.emit('failed', { ...transfer.info, reason });
     }
 
