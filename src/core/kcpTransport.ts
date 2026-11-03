@@ -29,6 +29,8 @@ import { log, logError } from './logger';
  * - 'sessionConnected' (peerId)  入站会话握手完成
  * - 'sessionClosed' (peerId)     会话关闭
  * - 'sessionError' (peerId, err) 会话错误（如链路死亡）
+ * - 'transportError' (err, target?) socket 级错误（发送失败、权限被拒等）。
+ *   注意不使用 'error' 事件名：EventEmitter 对无人监听的 'error' 会直接抛出异常。
  */
 
 const PACKET_CONTROL = 0x01;
@@ -110,12 +112,13 @@ export class KcpTransport extends events.EventEmitter {
 
         return new Promise((resolve, reject) => {
             const socket = dgram.createSocket('udp4');
-            socket.once('error', err => {
+            // 常驻监听（而不是 once）：第一次错误后监听被移除，之后的 socket 错误会变成未处理异常
+            socket.on('error', err => {
                 if (!this._isRunning) {
                     socket.close();
                     reject(err);
                 } else {
-                    this.emit('error', err);
+                    this.emit('transportError', err);
                 }
             });
             socket.on('message', (msg, rinfo) => this._handlePacket(msg, rinfo));
@@ -454,7 +457,7 @@ export class KcpTransport extends events.EventEmitter {
             const packet = Buffer.allocUnsafe(1 + data.length);
             packet.writeUInt8(PACKET_KCP, 0);
             data.copy(packet, 1);
-            this._socket.send(packet, 0, packet.length, session.port, session.ip);
+            this._rawSend(packet, session.port, session.ip);
         });
         return session;
     }
@@ -501,6 +504,24 @@ export class KcpTransport extends events.EventEmitter {
         const packet = Buffer.allocUnsafe(1 + payload.length);
         packet.writeUInt8(PACKET_CONTROL, 0);
         payload.copy(packet, 1);
-        this._socket.send(packet, 0, packet.length, port, ip);
+        this._rawSend(packet, port, ip);
+    }
+
+    /** 统一的 UDP 发送：带回调，失败只上报 'transportError'，不抛出 */
+    private _rawSend(packet: Buffer, port: number, ip: string): void {
+        const socket = this._socket;
+        if (!socket) {
+            return;
+        }
+        const target = `${ip}:${port}`;
+        try {
+            socket.send(packet, 0, packet.length, port, ip, err => {
+                if (err) {
+                    this.emit('transportError', err, target);
+                }
+            });
+        } catch (err) {
+            this.emit('transportError', err as Error, target);
+        }
     }
 }

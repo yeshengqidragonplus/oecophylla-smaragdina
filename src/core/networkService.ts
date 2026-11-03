@@ -4,6 +4,7 @@ import * as events from 'events';
 import * as fs from 'fs';
 import { KcpTransport } from './kcpTransport';
 import { log, logError } from './logger';
+import { classifyNetError, ErrorThrottle, NetErrorInfo } from './netErrors';
 
 export interface PeerInfo {
     id: string;
@@ -89,6 +90,11 @@ export class NetworkService extends events.EventEmitter {
     private _heartbeatIntervalTimer: NodeJS.Timeout | null = null;
     private _discoveryIntervalTimer: NodeJS.Timeout | null = null;
 
+    /** 网络错误日志限流（断网时每个 UDP 包都会失败，不能每条都写日志） */
+    private _errorThrottle = new ErrorThrottle();
+    private _netErrorCounts: Map<string, number> = new Map();
+    private _lastNetError: (NetErrorInfo & { scope: string; target?: string; at: number }) | null = null;
+
     constructor() {
         super();
         this._hostname = os.hostname();
@@ -156,13 +162,15 @@ export class NetworkService extends events.EventEmitter {
             const udpServer = dgram.createSocket({ type: 'udp4', reuseAddr: true });
 
             udpServer.on('error', (err) => {
-                logError('UDP Server error:', err);
                 if (!settled) {
+                    logError('UDP Server error:', err);
                     settled = true;
                     udpServer.close();
                     reject(err);
                 } else {
-                    this.emit('error', err);
+                    // 运行期错误（网络切换、网卡禁用、权限被拒等）只记录与上报：
+                    // 不能 emit('error')——EventEmitter 对没有监听者的 'error' 事件会直接抛出
+                    this._reportNetError('udp', err);
                 }
             });
 
@@ -192,7 +200,7 @@ export class NetworkService extends events.EventEmitter {
         try {
             const socket = dgram.createSocket({ type: 'udp4', reuseAddr: true });
             socket.on('error', err => {
-                logError('Discovery socket error:', err.message);
+                this._reportNetError('discovery', err);
             });
             socket.on('message', (msg, rinfo) => {
                 try {
@@ -234,20 +242,12 @@ export class NetworkService extends events.EventEmitter {
         const buffer = Buffer.from(JSON.stringify(message));
 
         // 从主 socket 发出（源端口 = 主端口，对方据此回复），目标为共享发现端口
-        try {
-            this._udpServer.send(buffer, 0, buffer.length, DISCOVERY_PORT, '255.255.255.255');
-        } catch (err) {
-            logError('Failed to send discovery broadcast:', err);
-        }
+        this._udpSend(buffer, DISCOVERY_PORT, '255.255.255.255', 'discovery');
 
         // 也向子网广播地址发送
         const subnetBroadcast = this._getSubnetBroadcast();
         if (subnetBroadcast) {
-            try {
-                this._udpServer.send(buffer, 0, buffer.length, DISCOVERY_PORT, subnetBroadcast);
-            } catch (err) {
-                logError(`Failed to send discovery to ${subnetBroadcast}:`, err);
-            }
+            this._udpSend(buffer, DISCOVERY_PORT, subnetBroadcast, 'discovery');
         }
     }
 
@@ -466,6 +466,11 @@ export class NetworkService extends events.EventEmitter {
 
         this._transport.on('sessionError', (peerId: string, err: Error) => {
             logError(`KCP session error (${peerId}):`, err.message);
+        });
+
+        // socket 级错误（发送失败、权限被拒等）：分类记录，不抛出
+        this._transport.on('transportError', (err: Error, target?: string) => {
+            this._reportNetError('kcp', err, target);
         });
     }
 
@@ -769,11 +774,52 @@ export class NetworkService extends events.EventEmitter {
      * 通过 UDP 发送（仅用于发现/心跳消息）
      */
     private _sendTo(ip: string, port: number, message: NetworkMessage): void {
-        if (!this._udpServer) {
+        this._udpSend(Buffer.from(JSON.stringify(message)), port, ip, 'udp');
+    }
+
+    /**
+     * 统一的 UDP 发送：带回调，失败（含同步抛出的参数错误）一律分类上报而不是抛出。
+     * 不带回调的 send 失败会变成 socket 的未处理 'error' 事件。
+     */
+    private _udpSend(buffer: Buffer, port: number, ip: string, scope: string): void {
+        const socket = this._udpServer;
+        if (!socket) {
             return;
         }
-        const messageBuffer = Buffer.from(JSON.stringify(message));
-        this._udpServer.send(messageBuffer, 0, messageBuffer.length, port, ip);
+        const target = `${ip}:${port}`;
+        try {
+            socket.send(buffer, 0, buffer.length, port, ip, err => {
+                if (err) {
+                    this._reportNetError(scope, err, target);
+                }
+            });
+        } catch (err) {
+            this._reportNetError(scope, err as Error, target);
+        }
+    }
+
+    /** 记录并上报网络错误：分类、计数、限流日志，并通过 'networkError' 事件通知外部 */
+    private _reportNetError(scope: string, err: Error, target?: string): void {
+        const info = classifyNetError(err);
+        this._netErrorCounts.set(info.code, (this._netErrorCounts.get(info.code) ?? 0) + 1);
+        this._lastNetError = { ...info, scope, target, at: Date.now() };
+
+        const suppressed = this._errorThrottle.check(`${scope}:${info.code}`);
+        if (suppressed !== null) {
+            const more = suppressed > 0 ? `（期间另有 ${suppressed} 条同类错误已合并）` : '';
+            logError(`[网络错误] ${scope}${target ? ` → ${target}` : ''}：${info.code} ${info.message}${more}${info.hint ? `。${info.hint}` : ''}`);
+        }
+        this.emit('networkError', this._lastNetError);
+    }
+
+    /** 最近一次网络错误（供诊断与状态展示） */
+    public getLastNetError(): (NetErrorInfo & { scope: string; target?: string; at: number }) | null {
+        return this._lastNetError;
+    }
+
+    /** 各错误码累计次数（供诊断） */
+    public getNetErrorCounts(): Record<string, number> {
+        return Object.fromEntries(this._netErrorCounts);
     }
 
     /**
