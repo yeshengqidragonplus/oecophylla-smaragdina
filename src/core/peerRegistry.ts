@@ -479,6 +479,16 @@ export class PeerRegistry extends events.EventEmitter {
                 return rec;
             }
         }
+        // 旧版的 id 就是 `ip:端口`：即使这条记录从未以该地址作过 id（直接以实例 ID 建立），也按当前地址认出来
+        const match = /^(\d{1,3}(?:\.\d{1,3}){3}):(\d{1,5})$/.exec(idOrAlias);
+        if (match) {
+            const port = Number(match[2]);
+            for (const rec of this._byId.values()) {
+                if (rec.ip === match[1] && rec.port === port) {
+                    return rec;
+                }
+            }
+        }
         return undefined;
     }
 

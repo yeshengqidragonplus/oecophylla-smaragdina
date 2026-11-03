@@ -41,6 +41,8 @@ export interface StoredMessage {
     timestamp: number;
     /** 仅发出的消息有：发送中 / 已送达（对端传输层确认）/ 失败 */
     status?: MessageStatus;
+    /** status 为 failed 时的原因 */
+    error?: string;
     file?: StoredFile;
 }
 

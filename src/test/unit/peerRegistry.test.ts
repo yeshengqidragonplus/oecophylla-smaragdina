@@ -146,6 +146,14 @@ suite('PeerRegistry：身份与合并', () => {
         assert.deepStrictEqual(restarted, ['p:8080']);
     });
 
+    test('旧版 ip:端口 形式的 id 按当前地址解析到以实例 ID 建立的联系人（旧会话、旧引用不会因此另起一个联系人）', () => {
+        const registry = new PeerRegistry();
+        registry.observe({ kind: 'ack', ip: '10.0.0.8', port: 6688, iid: 'machine:6688', now: T0 });
+        assert.strictEqual(registry.resolve('10.0.0.8:6688')?.id, 'machine:6688');
+        assert.strictEqual(registry.resolve('10.0.0.8:7777'), undefined);
+        assert.strictEqual(registry.resolve('not-an-address'), undefined);
+    });
+
     test('自己的 ensureByAddress：未知地址补建为非手工、离线的条目，重复调用不重复创建', () => {
         const registry = new PeerRegistry();
         const first = registry.ensureByAddress('10.0.0.3', 8080);
