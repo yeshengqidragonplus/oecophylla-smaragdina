@@ -2,7 +2,7 @@ import * as dgram from 'dgram';
 import * as os from 'os';
 import * as events from 'events';
 import * as fs from 'fs';
-import { KcpTransport } from './kcpTransport';
+import { KcpTransport, isRetryableKcpError } from './kcpTransport';
 import { log, logError } from './logger';
 import { classifyNetError, ErrorThrottle, NetErrorInfo } from './netErrors';
 import {
@@ -633,12 +633,26 @@ export class NetworkService extends events.EventEmitter {
     }
 
     /**
-     * 通过 KCP 发送消息到指定 peer
+     * 通过 KCP 发送消息到指定 peer。
+     * 会话失效类错误（对端重启/睡眠后残留的僵尸会话、确认超时）时，销毁旧会话、重新握手并重发一次——
+     * 用户不必手动点第二次。重发的是完整帧，对端文件分块按块号去重，不会重复落盘。
      */
     private async _sendViaTransport(peerId: string, message: NetworkMessage): Promise<void> {
-        await this._ensureSession(peerId);
         const data = Buffer.from(JSON.stringify(message));
-        await this._transport!.send(peerId, data);
+        for (let attempt = 0; ; attempt++) {
+            await this._ensureSession(peerId);
+            try {
+                await this._transport!.send(peerId, data);
+                return;
+            } catch (err) {
+                if (attempt === 0 && isRetryableKcpError(err)) {
+                    log(`[会话] 发送失败（${(err as Error).message}），会话可能已失效，重建会话后重试一次`);
+                    this._transport?.disconnect(peerId);
+                    continue;
+                }
+                throw err;
+            }
+        }
     }
 
     public createTransferTask(

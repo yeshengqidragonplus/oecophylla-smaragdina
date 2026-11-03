@@ -1,3 +1,4 @@
+import * as crypto from 'crypto';
 import * as dgram from 'dgram';
 import * as events from 'events';
 import { Kcp } from './kcp';
@@ -11,18 +12,22 @@ import { log, logError } from './logger';
  *
  * 数据报格式（第 1 字节区分类型）：
  * - 0x01 控制报文：JSON，用于会话握手与关闭
- *   - {"t":"syn","conv":<n>,"id":"<发起方 peerId>"}  建连请求（发起方选随机 conv）
- *   - {"t":"ack","conv":<n>,"id":"<应答方 peerId>"}  建连确认
- *   - {"t":"fin","conv":<n>}                          会话关闭
+ *   - {"t":"syn","conv":<n>,"id":"<发起方 peerId>","boot":"<发起方启动标识>"}  建连请求（发起方选随机 conv）
+ *   - {"t":"ack","conv":<n>,"id":"<应答方 peerId>","boot":"<应答方启动标识>"}  建连确认
+ *   - {"t":"fin","conv":<n>}   会话关闭
+ *   - {"t":"rst","conv":<n>}   "我没有这个会话"：收到未知 conv 的 KCP 报文时回复，让对端立刻销毁僵尸会话
  * - 0x02 KCP 报文：原始 KCP 段，conv 标识会话
  *
  * 业务帧格式（KCP 可靠字节流之上）：4 字节大端长度前缀 + JSON 负载，
  * 与原 TCP 实现一致。握手报文自带身份（id 字段），无需单独身份帧。
+ * 长度为 0 的帧是保活探测，接收端直接丢弃。
  *
  * 在线检测：握手 SYN 每 500ms 重发，超时（默认 5 秒）未收到 ACK 即判定
  * 对端离线——与原 TCP 建连超时语义一致。
  *
- * 双向同时建连仲裁：发起方 peerId 字典序较小的一方的会话胜出。
+ * 会话仲裁（同一对端出现第二个 SYN 时）：
+ * - 同一发起方换了 conv，或对端 boot 标识变了（进程重启过）：旧会话已无意义，直接替换；
+ * - 双向同时建连（我们先发起、对端也发起）：发起方 id 字典序较小的会话胜出。
  *
  * 事件（与 TcpTransport 一致）：
  * - 'data' (peerId, Buffer)      收到一条完整业务消息
@@ -48,11 +53,32 @@ const BACKPRESSURE_POLL = 20;
 const ACK_STALL_TIMEOUT = 5000;
 /** 空闲会话回收时间：超过该时长无任何收发则关闭（心跳在主通道，业务通道允许静默） */
 const SESSION_IDLE_TIMEOUT = 10 * 60 * 1000;
+/** 同一来源同一 conv 的 rst 回复最小间隔，避免对端持续发包时被回复风暴 */
+const RST_MIN_INTERVAL = 1000;
+/** 同一会话两次保活探测的最小间隔 */
+const KEEPALIVE_MIN_INTERVAL = 1000;
+
+export type KcpErrorCode = 'NO_SESSION' | 'SESSION_CLOSED' | 'ACK_TIMEOUT' | 'SEND_FAILED' | 'CONNECT_TIMEOUT';
+
+/** 带错误码的传输层错误，上层据此决定是否重建会话重试 */
+export class KcpError extends Error {
+    constructor(public readonly code: KcpErrorCode, message: string) {
+        super(message);
+        this.name = 'KcpError';
+    }
+}
+
+/** 会话失效类错误：重建会话后重发是安全的 */
+export function isRetryableKcpError(err: unknown): boolean {
+    return err instanceof KcpError
+        && (err.code === 'NO_SESSION' || err.code === 'SESSION_CLOSED' || err.code === 'ACK_TIMEOUT');
+}
 
 interface ControlMessage {
-    t: 'syn' | 'ack' | 'fin';
+    t: 'syn' | 'ack' | 'fin' | 'rst';
     conv?: number;
     id?: string;
+    boot?: string;
 }
 
 interface KcpSession {
@@ -62,11 +88,14 @@ interface KcpSession {
     conv: number;
     /** 本会话发起方的 peerId（双向建连仲裁用） */
     initiator: string;
+    /** 对端的启动标识：变化说明对端进程重启过，旧会话作废 */
+    remoteBoot?: string;
     kcp: Kcp;
     /** 拆帧缓冲 */
     recvBuffer: Buffer;
     established: boolean;
     lastActive: number;
+    lastKeepaliveAt: number;
 }
 
 export class KcpTransport extends events.EventEmitter {
@@ -74,10 +103,16 @@ export class KcpTransport extends events.EventEmitter {
     private _port: number;
     /** 本端 peerId（`ip:主端口`），用于握手身份和双向建连仲裁 */
     private _localId: string = '';
+    /** 本进程本次启动的随机标识，随握手发出；对端据此识别"我重启过" */
+    private readonly _boot: string = crypto.randomBytes(4).toString('hex');
     /** key: peerId -> session */
     private _sessions: Map<string, KcpSession> = new Map();
     /** key: conv -> session（KCP 报文按 conv 路由） */
     private _convIndex: Map<number, KcpSession> = new Map();
+    /** 进行中的建连：同一对端并发 connect 共用一次握手 */
+    private _pendingConnects: Map<string, Promise<void>> = new Map();
+    /** rst 回复限流：key 为 `ip:port:conv` */
+    private _lastRstAt: Map<string, number> = new Map();
     private _updateTimer: ReturnType<typeof setInterval> | null = null;
     private _isRunning: boolean = false;
 
@@ -96,6 +131,10 @@ export class KcpTransport extends events.EventEmitter {
 
     get isRunning(): boolean {
         return this._isRunning;
+    }
+
+    get boot(): string {
+        return this._boot;
     }
 
     setLocalId(id: string): void {
@@ -148,6 +187,7 @@ export class KcpTransport extends events.EventEmitter {
         });
         this._sessions.clear();
         this._convIndex.clear();
+        this._lastRstAt.clear();
 
         if (this._socket) {
             try {
@@ -171,6 +211,7 @@ export class KcpTransport extends events.EventEmitter {
     /**
      * 主动与远程 peer 握手建立 KCP 会话。
      * SYN 每 500ms 重发，超时未收到 ACK 视为对端离线。
+     * 同一对端的并发调用共用一次握手，避免产生多个互相冲突的会话。
      */
     connect(peerId: string, host: string, port: number, timeoutMs: number = 5000): Promise<void> {
         const existing = this._sessions.get(peerId);
@@ -178,6 +219,19 @@ export class KcpTransport extends events.EventEmitter {
             return Promise.resolve();
         }
 
+        const pending = this._pendingConnects.get(peerId);
+        if (pending) {
+            return pending;
+        }
+
+        const attempt = this._doConnect(peerId, host, port, timeoutMs).finally(() => {
+            this._pendingConnects.delete(peerId);
+        });
+        this._pendingConnects.set(peerId, attempt);
+        return attempt;
+    }
+
+    private _doConnect(peerId: string, host: string, port: number, timeoutMs: number): Promise<void> {
         return new Promise((resolve, reject) => {
             // 随机 32 位 conv；同对 peer 碰撞概率可忽略
             const conv = (Math.floor(Math.random() * 0xfffffffe) + 1) >>> 0;
@@ -186,7 +240,7 @@ export class KcpTransport extends events.EventEmitter {
             this._convIndex.set(conv, session);
 
             log(`[KCP] 发起握手 → ${peerId}（${host}:${port}，conv=${conv}）`);
-            const syn: ControlMessage = { t: 'syn', conv, id: this._localId };
+            const syn: ControlMessage = { t: 'syn', conv, id: this._localId, boot: this._boot };
             this._sendControl(host, port, syn);
             let synCount = 1;
             const retryTimer = setInterval(() => {
@@ -208,9 +262,11 @@ export class KcpTransport extends events.EventEmitter {
                 if (current === session) {
                     this._sessions.delete(peerId);
                 }
-                this._convIndex.delete(conv);
+                if (this._convIndex.get(conv) === session) {
+                    this._convIndex.delete(conv);
+                }
                 logError(`[KCP] 握手超时（${timeoutMs}ms）: ${peerId} 未应答——对方离线、未升级到 KCP 版本或 UDP 端口被防火墙拦截`);
-                reject(new Error(`连接 ${peerId} 超时`));
+                reject(new KcpError('CONNECT_TIMEOUT', `连接 ${peerId} 超时`));
             }, timeoutMs);
 
             // 同时监听双向建连仲裁后被入站会话替换的情况：
@@ -232,25 +288,27 @@ export class KcpTransport extends events.EventEmitter {
      * 因此这里等到发送队列被 ACK 清空才 resolve——确认超时
      * （ACK_STALL_TIMEOUT 内无任何确认进展）视为对端离线，
      * 销毁会话并抛错，对齐原 TCP 写失败的快速失败语义。
+     *
+     * 失败一律抛 KcpError，上层可据 isRetryableKcpError 决定是否重建会话重试。
      */
     async send(peerId: string, data: Buffer): Promise<void> {
         const session = this._sessions.get(peerId);
         if (!session || !session.established) {
-            throw new Error(`没有到 ${peerId} 的连接`);
+            throw new KcpError('NO_SESSION', `没有到 ${peerId} 的连接`);
         }
         const frame = KcpTransport.encodeFrame(data);
 
         // 背压：在途段过多时等待 KCP 消化
         while (session.kcp.waitSnd() > BACKPRESSURE_HIGH) {
             if (this._sessions.get(peerId) !== session) {
-                throw new Error(`到 ${peerId} 的连接已断开`);
+                throw new KcpError('SESSION_CLOSED', `到 ${peerId} 的连接已断开`);
             }
             await new Promise<void>(r => setTimeout(r, BACKPRESSURE_POLL));
         }
 
         const ret = session.kcp.send(frame);
         if (ret < 0) {
-            throw new Error(`KCP 发送失败（code=${ret}）`);
+            throw new KcpError('SEND_FAILED', `KCP 发送失败（code=${ret}）`);
         }
         session.lastActive = Date.now();
 
@@ -259,7 +317,7 @@ export class KcpTransport extends events.EventEmitter {
         let stallSince = Date.now();
         while (session.kcp.waitSnd() > 0) {
             if (this._sessions.get(peerId) !== session || session.kcp.isDeadLink) {
-                throw new Error(`到 ${peerId} 的连接已断开`);
+                throw new KcpError('SESSION_CLOSED', `到 ${peerId} 的连接已断开`);
             }
             const wait = session.kcp.waitSnd();
             const now = Date.now();
@@ -268,8 +326,10 @@ export class KcpTransport extends events.EventEmitter {
                 stallSince = now;
             } else if (now - stallSince > ACK_STALL_TIMEOUT) {
                 logError(`[KCP] 发送确认停滞 ${ACK_STALL_TIMEOUT}ms（剩余未确认段 ${wait}），判定 ${peerId} 离线，销毁会话`);
+                // 尽力通知对端丢弃会话（对端若还活着，就不会留下一个单边的僵尸会话）
+                this._sendControl(session.ip, session.port, { t: 'fin', conv: session.conv });
                 this._destroySession(session, true);
-                throw new Error(`发送至 ${peerId} 确认超时（对端可能已离线）`);
+                throw new KcpError('ACK_TIMEOUT', `发送至 ${peerId} 确认超时（对端可能已离线）`);
             }
             await new Promise<void>(r => setTimeout(r, BACKPRESSURE_POLL));
         }
@@ -304,7 +364,7 @@ export class KcpTransport extends events.EventEmitter {
         if (type === PACKET_CONTROL) {
             this._handleControl(msg.subarray(1), rinfo);
         } else if (type === PACKET_KCP) {
-            this._handleKcpPacket(msg.subarray(1));
+            this._handleKcpPacket(msg.subarray(1), rinfo);
         }
     }
 
@@ -326,6 +386,9 @@ export class KcpTransport extends events.EventEmitter {
             case 'fin':
                 this._handleFin(ctrl);
                 break;
+            case 'rst':
+                this._handleRst(ctrl, rinfo);
+                break;
         }
     }
 
@@ -336,29 +399,44 @@ export class KcpTransport extends events.EventEmitter {
         }
         const peerId = ctrl.id;
         const conv = ctrl.conv >>> 0;
+        const remoteBoot = typeof ctrl.boot === 'string' ? ctrl.boot : undefined;
         const existing = this._sessions.get(peerId);
 
         if (existing) {
             if (existing.conv === conv) {
                 // SYN 重发：幂等地再次确认
-                this._sendControl(rinfo.address, rinfo.port, { t: 'ack', conv, id: this._localId });
+                this._sendControl(rinfo.address, rinfo.port, { t: 'ack', conv, id: this._localId, boot: this._boot });
                 return;
             }
-            // 双向同时建连：发起方 peerId 字典序较小者胜出
-            if (existing.initiator <= peerId) {
-                // 已有会话胜出（含本端先发起且本端 id 较小的情况），忽略对方的 SYN
+
+            const peerRestarted = !!remoteBoot && !!existing.remoteBoot && remoteBoot !== existing.remoteBoot;
+            if (existing.initiator === peerId || peerRestarted) {
+                // 同一发起方换了 conv（它丢了旧会话），或对端进程重启过：旧会话已无意义，直接替换。
+                // 旧实现在这里按"发起方 id 字典序"仲裁，同一发起方时恒判旧会话胜出，
+                // 导致对端重启/睡眠唤醒后的新握手被忽略，最长 10 分钟单向不通。
+                log(`[KCP] ${peerId} ${peerRestarted ? '已重启' : '重新发起了握手'}，替换旧会话（conv ${existing.conv} → ${conv}）`);
+                this._destroySession(existing, false);
+            } else if (existing.initiator <= peerId) {
+                // 双向同时建连：我们先发起且我方 id 较小，已有会话胜出，忽略对方的 SYN
                 log(`[KCP] 双向建连仲裁：保留已有会话（发起方 ${existing.initiator}），忽略 ${peerId} 的 SYN`);
+                if (existing.established) {
+                    // 已有会话若已建立，对端又来了新 SYN，说明对端可能单边丢了会话：
+                    // 发一个保活探测——对端没有该会话会回 rst，我们销毁后，对端下一次 SYN 重发即可建连
+                    this._sendKeepalive(existing);
+                }
                 return;
+            } else {
+                log(`[KCP] 双向建连仲裁：${peerId} 发起的会话胜出，替换已有会话（发起方 ${existing.initiator}）`);
+                this._destroySession(existing, false);
             }
-            log(`[KCP] 双向建连仲裁：${peerId} 发起的会话胜出，替换已有会话（发起方 ${existing.initiator}）`);
-            this._destroySession(existing, false);
         }
 
         const session = this._createSession(peerId, rinfo.address, rinfo.port, conv, peerId);
+        session.remoteBoot = remoteBoot;
         session.established = true;
         this._sessions.set(peerId, session);
         this._convIndex.set(conv, session);
-        this._sendControl(rinfo.address, rinfo.port, { t: 'ack', conv, id: this._localId });
+        this._sendControl(rinfo.address, rinfo.port, { t: 'ack', conv, id: this._localId, boot: this._boot });
         log(`KCP inbound session established: ${peerId}`);
         this.emit('sessionConnected', peerId);
         this.emit('_established', peerId);
@@ -374,6 +452,7 @@ export class KcpTransport extends events.EventEmitter {
             return;
         }
         session.established = true;
+        session.remoteBoot = typeof ctrl.boot === 'string' ? ctrl.boot : undefined;
         session.lastActive = Date.now();
         log(`KCP connected to ${session.peerId}`);
         this.emit('_established', session.peerId);
@@ -390,14 +469,33 @@ export class KcpTransport extends events.EventEmitter {
         }
     }
 
+    /** 对端声明没有这个会话（它重启过或已丢弃）：立即销毁本端的僵尸会话 */
+    private _handleRst(ctrl: ControlMessage, rinfo: dgram.RemoteInfo): void {
+        if (typeof ctrl.conv !== 'number') {
+            return;
+        }
+        const session = this._convIndex.get(ctrl.conv >>> 0);
+        // 只处理已建立的会话（握手进行中的由 SYN 重发与超时处理），且来源必须是该会话的对端
+        if (!session || !session.established || session.ip !== rinfo.address) {
+            return;
+        }
+        log(`[KCP] 收到 ${session.peerId} 的 RST：对端已没有该会话（可能重启过），销毁僵尸会话`);
+        this._destroySession(session, true);
+    }
+
     /** KCP 数据报：按 conv 路由到会话 */
-    private _handleKcpPacket(packet: Buffer): void {
+    private _handleKcpPacket(packet: Buffer, rinfo: dgram.RemoteInfo): void {
         if (packet.length < 24) {
             return;
         }
         const conv = packet.readUInt32LE(0);
         const session = this._convIndex.get(conv);
-        if (!session || !session.established) {
+        if (!session) {
+            // 本端没有这个会话（重启过或已销毁）：告诉对端，让它别再往僵尸会话里发
+            this._sendRst(rinfo, conv);
+            return;
+        }
+        if (!session.established) {
             return;
         }
         if (session.kcp.input(packet) < 0) {
@@ -411,6 +509,30 @@ export class KcpTransport extends events.EventEmitter {
             this._feedFraming(session, data);
             data = session.kcp.recv();
         }
+    }
+
+    private _sendRst(rinfo: dgram.RemoteInfo, conv: number): void {
+        const key = `${rinfo.address}:${rinfo.port}:${conv}`;
+        const now = Date.now();
+        const last = this._lastRstAt.get(key);
+        if (last !== undefined && now - last < RST_MIN_INTERVAL) {
+            return;
+        }
+        if (this._lastRstAt.size > 1000) {
+            this._lastRstAt.clear();
+        }
+        this._lastRstAt.set(key, now);
+        this._sendControl(rinfo.address, rinfo.port, { t: 'rst', conv });
+    }
+
+    /** 保活探测：发一个长度为 0 的空帧，对端没有该会话时会回 rst */
+    private _sendKeepalive(session: KcpSession): void {
+        const now = Date.now();
+        if (now - session.lastKeepaliveAt < KEEPALIVE_MIN_INTERVAL) {
+            return;
+        }
+        session.lastKeepaliveAt = now;
+        session.kcp.send(KcpTransport.encodeFrame(Buffer.alloc(0)));
     }
 
     /**
@@ -433,6 +555,9 @@ export class KcpTransport extends events.EventEmitter {
             }
             const frame = session.recvBuffer.subarray(4, 4 + frameLength);
             session.recvBuffer = session.recvBuffer.subarray(4 + frameLength);
+            if (frameLength === 0) {
+                continue; // 保活探测，不是业务帧
+            }
             this.emit('data', session.peerId, frame);
         }
     }
@@ -448,7 +573,8 @@ export class KcpTransport extends events.EventEmitter {
             peerId, ip, port, conv, initiator, kcp,
             recvBuffer: Buffer.alloc(0),
             established: false,
-            lastActive: Date.now()
+            lastActive: Date.now(),
+            lastKeepaliveAt: 0
         };
         kcp.setOutput(data => {
             if (!this._socket) {

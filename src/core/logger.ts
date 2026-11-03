@@ -11,6 +11,12 @@ interface LogSink {
 }
 
 let sink: LogSink | null = null;
+let consoleEnabled = true;
+
+/** 单元测试里关闭控制台输出，避免日志淹没测试结果 */
+export function setConsoleEnabled(enabled: boolean): void {
+    consoleEnabled = enabled;
+}
 
 /** 由 extension.ts 在激活时注入 OutputChannel */
 export function setLogSink(s: LogSink): void {
@@ -41,12 +47,16 @@ function timestamp(): string {
 
 export function log(...args: unknown[]): void {
     const line = format(args);
-    console.log(line);
+    if (consoleEnabled) {
+        console.log(line);
+    }
     sink?.appendLine(`[${timestamp()}] ${line}`);
 }
 
 export function logError(...args: unknown[]): void {
     const line = format(args);
-    console.error(line);
+    if (consoleEnabled) {
+        console.error(line);
+    }
     sink?.appendLine(`[${timestamp()}] [错误] ${line}`);
 }
