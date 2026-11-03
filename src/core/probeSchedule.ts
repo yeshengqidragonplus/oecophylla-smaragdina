@@ -44,3 +44,12 @@ export function nextProbeState(online: boolean, state: ProbeState | undefined, n
         offlineProbes: online ? 0 : (state?.offlineProbes ?? 0) + 1
     };
 }
+
+/**
+ * 维护节拍是否出现了异常间隔：两次节拍间隔超过 2 倍周期，说明进程被挂起过
+ * （睡眠唤醒、macOS App Nap、Windows 现代待机、调试暂停……）。
+ * 唤醒后网卡与地址常已变化、旧会话已失效，需要重新发现。
+ */
+export function isClockJump(lastTickAt: number, now: number, tickInterval: number): boolean {
+    return lastTickAt > 0 && now - lastTickAt > tickInterval * 2;
+}

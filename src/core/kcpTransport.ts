@@ -58,6 +58,12 @@ const SESSION_IDLE_TIMEOUT = 10 * 60 * 1000;
 const RST_MIN_INTERVAL = 1000;
 /** 同一会话两次保活探测的最小间隔 */
 const KEEPALIVE_MIN_INTERVAL = 1000;
+/**
+ * KCP 单个数据报的 MTU：加 1 字节类型前缀与 28 字节 IP/UDP 头后约 1229 字节。
+ * VPN/TUN 链路（常见 1280–1380）下不会被 IP 分片；部分防火墙与企业网络会丢弃分片包。
+ * 一帧最多 128 个分片（kcp.ts 的接收窗口），当前最大业务帧约 88KB，约 75 个分片，有余量。
+ */
+const KCP_MTU = 1200;
 
 export type KcpErrorCode = 'NO_SESSION' | 'SESSION_CLOSED' | 'ACK_TIMEOUT' | 'SEND_FAILED' | 'CONNECT_TIMEOUT';
 
@@ -385,6 +391,16 @@ export class KcpTransport extends events.EventEmitter {
         }
     }
 
+    /**
+     * 断开所有会话（睡眠唤醒、网卡变化后旧会话大概率已失效）：发 FIN 并销毁，下次发送按需重建
+     */
+    disconnectAll(): void {
+        for (const session of Array.from(this._sessions.values())) {
+            this._sendControl(session.ip, session.port, { t: 'fin', conv: session.conv });
+            this._destroySession(session, false);
+        }
+    }
+
     private static encodeFrame(payload: Buffer): Buffer {
         const frame = Buffer.allocUnsafe(4 + payload.length);
         frame.writeUInt32BE(payload.length, 0);
@@ -614,6 +630,7 @@ export class KcpTransport extends events.EventEmitter {
         // 极速模式：nodelay、10ms 时钟、快速重传阈值 2、关闭拥塞控制（内网场景）
         kcp.setNodelay(1, UPDATE_INTERVAL, 2, 1);
         kcp.setWndSize(256, 256);
+        kcp.setMtu(KCP_MTU);
         const session: KcpSession = {
             peerId, ip, port, conv, initiator, kcp,
             recvBuffer: Buffer.alloc(0),

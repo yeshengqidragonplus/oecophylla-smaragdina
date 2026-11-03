@@ -5,6 +5,7 @@ import {
     OFFLINE_PROBE_FAST_TRIES,
     OFFLINE_PROBE_SLOW_INTERVAL,
     ProbeState,
+    isClockJump,
     isProbeDue,
     nextProbeState,
     probeInterval
@@ -50,5 +51,15 @@ suite('probeSchedule：对端探测节奏', () => {
         state = nextProbeState(true, state, 60_000);
         assert.strictEqual(state.offlineProbes, 0);
         assert.strictEqual(state.lastProbeAt, 60_000);
+    });
+});
+
+suite('probeSchedule：睡眠唤醒检测', () => {
+    test('节拍间隔超过 2 倍周期判定为被挂起过；首次节拍与正常抖动不算', () => {
+        assert.strictEqual(isClockJump(0, 100_000, 5000), false);
+        assert.strictEqual(isClockJump(1000, 1000 + 5000, 5000), false);
+        assert.strictEqual(isClockJump(1000, 1000 + 5400, 5000), false);
+        assert.strictEqual(isClockJump(1000, 1000 + 10_001, 5000), true);
+        assert.strictEqual(isClockJump(1000, 1000 + 3_600_000, 5000), true);
     });
 });

@@ -15,7 +15,7 @@ import {
     listLocalAddresses,
     pickPrimary
 } from './netInterfaces';
-import { ProbeState, isProbeDue, nextProbeState } from './probeSchedule';
+import { ProbeState, isClockJump, isProbeDue, nextProbeState } from './probeSchedule';
 import { PeerMeta, PeerRecord, PeerRegistry, Presence } from './peerRegistry';
 
 /** 线上协议版本：2 = 带实例 ID / boot 标识 / meta */
@@ -65,6 +65,20 @@ export interface NetworkMessage {
     /** 发送方本次启动标识：变化说明它重启过 */
     boot?: string;
     meta?: PeerMeta;
+}
+
+/** 网络服务的运行状态，供界面显示与诊断 */
+export interface NetworkStatus {
+    state: 'stopped' | 'starting' | 'running' | 'error';
+    /** 主 UDP 端口 */
+    port: number;
+    /** 主网卡地址（仅展示） */
+    ip: string;
+    instanceId: string;
+    boot: string;
+    /** state 为 error 时的失败原因 */
+    error?: string;
+    interfaces: Array<{ name: string; address: string; prefix: number; broadcast: string; virtual: boolean }>;
 }
 
 export interface StartOptions {
@@ -121,6 +135,10 @@ export class NetworkService extends events.EventEmitter {
     private _meta: PeerMeta = { os: process.platform, arch: process.arch, node: process.versions.node };
     /** 最近收到的业务消息 ID，用于去重 */
     private _seenMessageIds: Set<string> = new Set();
+    /** 上一次维护节拍的时间，用于检测睡眠唤醒 */
+    private _lastTickAt: number = 0;
+    private _state: NetworkStatus['state'] = 'stopped';
+    private _stateError: string | undefined;
     private _isRunning: boolean = false;
     private _transferTasks: Map<string, TransferTask> = new Map();
     private _transport: KcpTransport | null = null;
@@ -157,11 +175,25 @@ export class NetworkService extends events.EventEmitter {
         return this._transport;
     }
 
+    /**
+     * 启动网络服务；状态变化通过 'statusChange' 事件推送（starting → running / error）。
+     * 失败时抛出原因，同时状态置为 error。
+     */
     public async start(port: number, nickname?: string, options: StartOptions = {}): Promise<void> {
         if (this._isRunning) {
             this.stop();
         }
+        this._setState('starting');
+        try {
+            await this._startInternal(port, nickname, options);
+        } catch (err) {
+            this._setState('error', (err as Error).message);
+            throw err;
+        }
+        this._setState('running');
+    }
 
+    private async _startInternal(port: number, nickname: string | undefined, options: StartOptions): Promise<void> {
         this._port = port;
         this._nickname = nickname;
         if (options.machineId) {
@@ -367,11 +399,38 @@ export class NetworkService extends events.EventEmitter {
         if (this._peerTickTimer) {
             clearInterval(this._peerTickTimer);
         }
-        this._peerTickTimer = setInterval(() => {
-            this.registry.sweep();
-            this._probePeers();
-        }, PEER_TICK_INTERVAL);
+        this._lastTickAt = Date.now();
+        this._peerTickTimer = setInterval(() => this._peerTick(), PEER_TICK_INTERVAL);
         this._probePeers();
+    }
+
+    /**
+     * 对端维护节拍：检测睡眠唤醒与网卡变化，其余时间做离线判定与探测。
+     * 发生唤醒/网卡变化的这一拍不做离线判定：先让重新发出的探测有时间得到应答，
+     * 避免唤醒后一瞬间把所有对端误判为离线。
+     */
+    private _peerTick(): void {
+        const now = Date.now();
+        const jumped = isClockJump(this._lastTickAt, now, PEER_TICK_INTERVAL);
+        this._lastTickAt = now;
+        const networkChanged = this._refreshNetwork();
+
+        if (jumped || networkChanged) {
+            this._resumeDiscovery(jumped ? '检测到进程被挂起过（睡眠唤醒或系统节流）' : '网卡发生变化');
+            return;
+        }
+        this.registry.sweep();
+        this._probePeers();
+    }
+
+    /** 唤醒或网络变化后：丢弃旧会话、清空探测状态、立即重新发现并探测全部对端 */
+    private _resumeDiscovery(reason: string): void {
+        log(`[网络] ${reason}：重新发现并探测所有对端`);
+        this._probeState.clear();
+        this._transport?.disconnectAll();
+        this._sendDiscoveryBroadcast();
+        this._probePeers();
+        this.emit('networkResume', reason);
     }
 
     /**
@@ -521,6 +580,27 @@ export class NetworkService extends events.EventEmitter {
 
         this.registry.markAllOffline();
         this.emit('peersUpdate', this.getPeers());
+        this._setState('stopped');
+    }
+
+    private _setState(state: NetworkStatus['state'], error?: string): void {
+        this._state = state;
+        this._stateError = error;
+        this.emit('statusChange', this.getStatus());
+    }
+
+    public getStatus(): NetworkStatus {
+        return {
+            state: this._state,
+            port: this._port,
+            ip: this._localIp,
+            instanceId: this._instanceId,
+            boot: this._transport?.boot ?? '',
+            error: this._stateError,
+            interfaces: this._lanInterfaces.map(i => ({
+                name: i.name, address: i.address, prefix: i.prefix, broadcast: i.broadcast, virtual: i.virtual
+            }))
+        };
     }
 
     /**
@@ -901,6 +981,9 @@ export class NetworkService extends events.EventEmitter {
                 ? '无可用局域网网卡'
                 : lan.map(i => `${i.name} ${i.address}/${i.prefix}（广播 ${i.broadcast}${i.virtual ? '，疑似虚拟网卡' : ''}）`).join('；');
             log(`[网卡] 可用网卡：${desc}`);
+            if (this._isRunning) {
+                this.emit('statusChange', this.getStatus());
+            }
         }
         return changed;
     }
