@@ -1,3 +1,4 @@
+import * as path from 'path';
 import * as vscode from 'vscode';
 import { ChatViewProvider } from './chatViewProvider';
 import { SettingsPanel } from './settingsPanel';
@@ -7,11 +8,17 @@ import { PeersEditor } from './peersEditor';
 import { initNetworkIdentity, startNetworkFromConfig, stopNetwork } from './networkLauncher';
 import { scanSubnet, showDiagnostics } from './diagnose';
 import { registerStatusUi } from './statusBar';
+import { resolveReceiveDir } from './receiveDir';
+import { ChatStore } from './core/chatStore';
+import { FileReceiver, cleanupStaleParts } from './core/fileReceiver';
+import { MessagingService } from './core/messaging';
 import { setLogSink, log } from './core/logger';
 import { getBuildHash } from './core/buildInfo';
 
 let chatProvider: ChatViewProvider;
 let peersManager: PeersManager;
+let chatStore: ChatStore;
+let messaging: MessagingService;
 
 export function activate(context: vscode.ExtensionContext) {
     // 日志通道：网络层与发送链路日志统一汇集于此，便于排查
@@ -31,8 +38,27 @@ export function activate(context: vscode.ExtensionContext) {
     // 初始化 PeersManager
     peersManager = new PeersManager(context);
 
+    // 聊天记录（一人一会话，旧版 chatSessions.json 首次启动时自动迁移）与消息服务
+    const storage = context.globalStorageUri.fsPath;
+    chatStore = new ChatStore(path.join(storage, 'chats'), {
+        legacyPath: path.join(storage, 'chatSessions.json'),
+        resolvePeerId: id => peersManager.canonicalId(id)
+    });
+    messaging = new MessagingService({
+        network: networkService,
+        store: chatStore,
+        receiver: new FileReceiver({ resolveDir: () => resolveReceiveDir(context) }),
+        displayName: id => {
+            const peer = peersManager.getPeerById(id);
+            return peer ? peersManager.getPeerDisplayName(peer) : id;
+        }
+    });
+    // 清理上次崩溃遗留的接收临时文件，并在聊天记录加载（含迁移）完成后刷新界面
+    cleanupStaleParts(resolveReceiveDir(context));
+    void chatStore.load().then(() => chatProvider?.refresh());
+
     // 注册 Chat View Provider
-    chatProvider = new ChatViewProvider(context.extensionUri, context, peersManager);
+    chatProvider = new ChatViewProvider(context.extensionUri, peersManager, chatStore, messaging);
     context.subscriptions.push(
         vscode.window.registerWebviewViewProvider(ChatViewProvider.viewType, chatProvider)
     );
@@ -123,8 +149,10 @@ export function activate(context: vscode.ExtensionContext) {
     console.log(`OS Chat 已激活`);
 }
 
-export function deactivate() {
+export async function deactivate(): Promise<void> {
+    messaging?.dispose();
     networkService.stop();
+    await chatStore?.flush();
     if (peersManager) {
         peersManager.flush();
     }

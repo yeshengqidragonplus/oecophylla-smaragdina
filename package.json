@@ -177,7 +177,7 @@
           "type": "string",
           "default": "",
           "scope": "machine",
-          "markdownDescription": "接收文件保存的**文件夹**路径；留空则保存在扩展全局存储目录下的 `downloads`。"
+          "markdownDescription": "接收文件保存的**文件夹**路径；留空则保存到系统“下载”文件夹下的 `OS Chat`。目录不可用时会自动回退并提示。"
         }
       }
     }
