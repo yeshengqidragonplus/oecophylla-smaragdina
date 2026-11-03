@@ -11,6 +11,7 @@
     "Other"
   ],
   "activationEvents": [
+    "onStartupFinished",
     "onView:OSChatView",
     "onCommand:myChat.openSettings",
     "onCommand:myChat.newChat",
@@ -20,13 +21,16 @@
     "onCommand:myChat.openPeersFile",
     "onCommand:myChat.showLogs"
   ],
+  "extensionKind": [
+    "ui"
+  ],
   "main": "./dist/extension.js",
   "contributes": {
     "viewsContainers": {
       "activitybar": [
         {
           "id": "OSChatContainer",
-          "title": "Oecophy Smaragdina Chat",
+          "title": "OS Chat",
           "icon": "media/robot.svg"
         }
       ]
@@ -46,36 +50,43 @@
       {
         "command": "myChat.openSettings",
         "title": "设置",
+        "category": "OS Chat",
         "icon": "$(gear)"
       },
       {
         "command": "myChat.newChat",
         "title": "新建会话",
-        "icon": "$(edit)"
+        "category": "OS Chat",
+        "icon": "$(add)"
       },
       {
         "command": "myChat.startNetwork",
         "title": "启动网络服务",
+        "category": "OS Chat",
         "icon": "$(play)"
       },
       {
         "command": "myChat.stopNetwork",
         "title": "停止网络服务",
+        "category": "OS Chat",
         "icon": "$(debug-stop)"
       },
       {
         "command": "myChat.editPeers",
         "title": "编辑聊天对象",
-        "icon": "$(edit)"
+        "category": "OS Chat",
+        "icon": "$(account)"
       },
       {
         "command": "myChat.openPeersFile",
         "title": "打开 peers.json 配置文件",
+        "category": "OS Chat",
         "icon": "$(file-code)"
       },
       {
         "command": "myChat.showLogs",
-        "title": "OSChat: 显示日志",
+        "title": "显示日志",
+        "category": "OS Chat",
         "icon": "$(output)"
       }
     ],
