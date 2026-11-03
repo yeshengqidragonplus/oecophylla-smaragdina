@@ -1,5 +1,6 @@
 import * as assert from 'assert';
 import { NetworkService } from '../../core/networkService';
+import { skipWithoutLan } from './helpers';
 
 type Internals = {
     _broadcastEnabled: boolean;
@@ -28,6 +29,7 @@ async function waitFor(condition: () => boolean, timeoutMs: number): Promise<boo
 suite('发现：单播探测不依赖广播', () => {
     test('两端都关闭广播；手工配置的对端靠单播探测互相找到，并被认领升级为稳定身份', async function () {
         this.timeout(10_000);
+        skipWithoutLan(this);
         const portA = randomBasePort();
         const portB = portA + 2000;
         const a = new NetworkService();
@@ -63,6 +65,7 @@ suite('发现：单播探测不依赖广播', () => {
 
     test('单播探测后对端只登记一次（不重复）', async function () {
         this.timeout(10_000);
+        skipWithoutLan(this);
         const portA = randomBasePort();
         const portB = portA + 2000;
         const a = new NetworkService();

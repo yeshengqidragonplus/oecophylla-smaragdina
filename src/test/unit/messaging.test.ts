@@ -8,6 +8,7 @@ import { FileReceiver } from '../../core/fileReceiver';
 import { setConsoleEnabled } from '../../core/logger';
 import { IncomingNotice, MessagingService } from '../../core/messaging';
 import { NetworkService } from '../../core/networkService';
+import { skipWithoutLan } from './helpers';
 
 function randomBasePort(): number {
     return 30000 + Math.floor(Math.random() * 15000);
@@ -61,7 +62,8 @@ suite('MessagingService：收发消息与文件（端到端，环回）', () => 
         return { network, store, messaging, notices, downloads };
     }
 
-    setup(async () => {
+    setup(async function () {
+        skipWithoutLan(this);
         tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'oschat-msg-'));
         const port = randomBasePort();
         a = await makeSide('a', port);

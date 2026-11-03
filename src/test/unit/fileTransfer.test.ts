@@ -7,6 +7,7 @@ import { FileReceiveService } from '../../core/fileReceiveService';
 import { FileReceiver } from '../../core/fileReceiver';
 import { setConsoleEnabled } from '../../core/logger';
 import { BusinessMessage, NetworkService, TransferTask } from '../../core/networkService';
+import { skipWithoutLan } from './helpers';
 
 function randomBasePort(): number {
     return 30000 + Math.floor(Math.random() * 15000);
@@ -39,7 +40,10 @@ suite('文件传输：发送流水线与落盘确认（端到端，环回）', (
     suiteSetup(() => setConsoleEnabled(false));
     suiteTeardown(() => setConsoleEnabled(true));
 
-    async function setupPair(withReceiver: boolean, resolveDir?: (dir: string) => string): Promise<Pair> {
+    async function setupPair(withReceiver: boolean, resolveDir?: (dir: string) => string, ctx?: Mocha.Context): Promise<Pair> {
+        if (ctx) {
+            skipWithoutLan(ctx);
+        }
         const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'oschat-xfer-'));
         const portA = randomBasePort();
         const a = new NetworkService();
@@ -77,7 +81,7 @@ suite('文件传输：发送流水线与落盘确认（端到端，环回）', (
 
     test('端到端：流水线发送 1.5MB 文件，接收端落盘后回 file_ack，内容一致，进度单调到 100', async function () {
         this.timeout(30_000);
-        pair = await setupPair(true);
+        pair = await setupPair(true, undefined, this);
         const { filePath, content } = makeFile(1_500_000);
         const task = pair.a.createTransferTask(pair.idB, [], [{ name: 'big.bin', path: filePath, size: content.length }]);
         const progress: number[] = [];
@@ -95,7 +99,7 @@ suite('文件传输：发送流水线与落盘确认（端到端，环回）', (
 
     test('0 字节文件端到端成功，接收端确实有这个文件（回归：旧实现发送端报成功、接收端没有文件）', async function () {
         this.timeout(20_000);
-        pair = await setupPair(true);
+        pair = await setupPair(true, undefined, this);
         const { filePath } = makeFile(0);
         const task = pair.a.createTransferTask(pair.idB, [], [{ name: 'empty.txt', path: filePath, size: 0 }]);
         await pair.a.executeTransferTask(task.id);
@@ -108,7 +112,7 @@ suite('文件传输：发送流水线与落盘确认（端到端，环回）', (
             const blocker = path.join(dir, 'blocker');
             fs.writeFileSync(blocker, 'x');
             return path.join(blocker, 'sub');
-        });
+        }, this);
         const { filePath, content } = makeFile(100_000);
         const task = pair.a.createTransferTask(pair.idB, [], [{ name: 'x.bin', path: filePath, size: content.length }]);
         await assert.rejects(() => pair.a.executeTransferTask(task.id), /对方没有成功保存「x\.bin」/);
@@ -117,7 +121,7 @@ suite('文件传输：发送流水线与落盘确认（端到端，环回）', (
 
     test('接收端从未收到数据（如重启过）：发送端立即失败，不干等 30 秒确认超时', async function () {
         this.timeout(20_000);
-        pair = await setupPair(true);
+        pair = await setupPair(true, undefined, this);
         // 模拟分块全部丢失：接收器丢弃所有分块，只剩 file_end 到达
         service!.receiver.handleChunk = () => undefined;
         const { filePath, content } = makeFile(100_000);
@@ -129,7 +133,7 @@ suite('文件传输：发送流水线与落盘确认（端到端，环回）', (
 
     test('旧版接收端（协议 < 3，不会回 file_ack）：发送端不等待确认，传输层确认即视为成功', async function () {
         this.timeout(20_000);
-        pair = await setupPair(false);
+        pair = await setupPair(false, undefined, this);
         const received: BusinessMessage[] = [];
         pair.b.on('message', m => received.push(m));
         // 模拟旧版对端：把 B 的协议版本记为 2
@@ -148,7 +152,7 @@ suite('文件传输：发送流水线与落盘确认（端到端，环回）', (
 
     test('取消：停止继续发送，任务状态为 cancelled', async function () {
         this.timeout(20_000);
-        pair = await setupPair(true);
+        pair = await setupPair(true, undefined, this);
         const { filePath, content } = makeFile(5_000_000);
         const task = pair.a.createTransferTask(pair.idB, [], [{ name: 'cancel.bin', path: filePath, size: content.length }]);
         pair.a.on('transferTaskUpdated', (t: TransferTask) => {
@@ -163,14 +167,14 @@ suite('文件传输：发送流水线与落盘确认（端到端，环回）', (
 
     test('待发送的文件被删除/不存在：给出可读提示', async function () {
         this.timeout(20_000);
-        pair = await setupPair(true);
+        pair = await setupPair(true, undefined, this);
         const task = pair.a.createTransferTask(pair.idB, [], [{ name: 'gone.bin', path: path.join(pair.dir, 'nope.bin'), size: 10 }]);
         await assert.rejects(() => pair.a.executeTransferTask(task.id), /已被移动或删除/);
     });
 
     test('已结束超过 10 分钟的任务会被清理（回归：任务表原先只增不删）', async function () {
         this.timeout(20_000);
-        pair = await setupPair(true);
+        pair = await setupPair(true, undefined, this);
         const old = pair.a.createTransferTask(pair.idB, ['x'], []);
         const internals = pair.a as unknown as { _transferTasks: Map<string, TransferTask> };
         old.status = 'completed';

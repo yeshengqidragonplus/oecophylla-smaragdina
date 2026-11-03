@@ -1,0 +1,32 @@
+name: CI
+
+# macOS / Windows / Linux 三平台跑类型检查、lint、单元测试与打包。
+# 核心模块（src/core）不依赖 vscode，单元测试在纯 Node 里即可跑，
+# 文件名清理、网卡过滤、路径处理等与系统相关的逻辑借此在三个系统上各验证一遍。
+on:
+  push:
+    branches: [master, main]
+  pull_request:
+
+jobs:
+  build-and-test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+      - run: npm ci
+      - name: 类型检查
+        run: npx tsc --noEmit
+      - name: Lint
+        run: npx eslint src
+      - name: 单元测试
+        run: npm run test:unit
+      - name: 打包
+        run: node esbuild.js --production
