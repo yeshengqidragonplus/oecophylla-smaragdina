@@ -9,6 +9,7 @@ import { initNetworkIdentity, startNetworkFromConfig, stopNetwork } from './netw
 import { scanSubnet, showDiagnostics } from './diagnose';
 import { registerStatusUi } from './statusBar';
 import { resolveReceiveDir } from './receiveDir';
+import { defaultDownloadDir } from './core/downloadDir';
 import { ChatStore } from './core/chatStore';
 import { FileReceiver, cleanupStaleParts } from './core/fileReceiver';
 import { MessagingService } from './core/messaging';
@@ -54,7 +55,8 @@ export function activate(context: vscode.ExtensionContext) {
         }
     });
     // 清理上次崩溃遗留的接收临时文件，并在聊天记录加载（含迁移）完成后刷新界面
-    cleanupStaleParts(resolveReceiveDir(context));
+    // （只清理已存在的目录，不能为了清理在用户的"下载"里凭空建一个文件夹）
+    cleanupStaleParts(vscode.workspace.getConfiguration('oschat').get<string>('downloadPath', '').trim() || defaultDownloadDir());
     void chatStore.load().then(() => chatProvider?.refresh());
 
     // 注册 Chat View Provider
