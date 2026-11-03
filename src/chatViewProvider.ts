@@ -5,6 +5,7 @@ import { PeersManager, StoredPeerInfo } from './peersManager';
 import { log, logError } from './logger';
 import { getBuildHash } from './buildInfo';
 import { networkService, NetworkMessage, TransferTask } from './networkService';
+import { startNetworkFromConfig, stopNetwork } from './networkLauncher';
 
 interface ChatMessage {
     id: string;
@@ -229,45 +230,19 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     }
 
     private async _handleStartNetwork(): Promise<void> {
-        console.log('[DEBUG] _handleStartNetwork called');
-        const config = vscode.workspace.getConfiguration('oschat');
-        const port = config.get('port', 8080);
-        const nickname = config.get('nickname', '');
-        const peersFilePath = this._peersManager.getPeersFilePath();
-
-        try {
-            await networkService.start(port, nickname, peersFilePath);
-            vscode.window.showInformationMessage(`网络服务已启动，监听端口 ${port}`);
-            // 通知 webview 更新状态
-            if (this._view) {
-                console.log('[DEBUG] Sending networkStatus running=true to webview');
-                this._view.webview.postMessage({
-                    type: 'networkStatus',
-                    running: true,
-                    port: port
-                });
-            } else {
-                console.log('[DEBUG] this._view is null');
-            }
-        } catch (error) {
-            console.log('[DEBUG] _handleStartNetwork error:', error);
-            vscode.window.showErrorMessage(`启动网络服务失败：${error}`);
-        }
+        const running = await startNetworkFromConfig(this._peersManager);
+        this._postNetworkStatus(running);
     }
 
     private _handleStopNetwork(): void {
-        console.log('[DEBUG] _handleStopNetwork called');
-        networkService.stop();
-        vscode.window.showInformationMessage('网络服务已停止');
-        // 通知 webview 更新状态
+        stopNetwork();
+        this._postNetworkStatus(false);
+    }
+
+    /** 把网络服务的实际运行状态同步给 webview */
+    private _postNetworkStatus(running: boolean): void {
         if (this._view) {
-            console.log('[DEBUG] Sending networkStatus running=false to webview');
-            this._view.webview.postMessage({
-                type: 'networkStatus',
-                running: false
-            });
-        } else {
-            console.log('[DEBUG] this._view is null in _handleStopNetwork');
+            this._view.webview.postMessage({ type: 'networkStatus', running });
         }
     }
 

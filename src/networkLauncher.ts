@@ -1,0 +1,55 @@
+import * as vscode from 'vscode';
+import { networkService } from './networkService';
+import { PeersManager } from './peersManager';
+import { logError } from './logger';
+
+const MIN_PORT = 1024;
+/** 业务端口 = 主端口 + 1000，必须不超过 65535 */
+const MAX_PORT = 64535;
+
+/**
+ * 读取最新配置并启动（或重启）网络服务。
+ * 命令面板、侧边栏按钮与自动启动共用这一个入口，保证行为一致，
+ * 且不会把临时参数写回用户设置。
+ *
+ * @returns 是否启动成功（失败原因已通过消息提示给用户）
+ */
+export async function startNetworkFromConfig(peersManager: PeersManager): Promise<boolean> {
+    const config = vscode.workspace.getConfiguration('oschat');
+    const port = config.get<number>('port', 8080);
+    const nickname = config.get<string>('nickname', '');
+
+    if (!Number.isInteger(port) || port < MIN_PORT || port > MAX_PORT) {
+        const message = `端口 ${port} 无效：请设置 ${MIN_PORT}-${MAX_PORT} 之间的整数（业务端口为主端口 + 1000）`;
+        logError(message);
+        offerOpenPortSetting(message);
+        return false;
+    }
+
+    try {
+        await networkService.start(port, nickname, peersManager.getPeersFilePath());
+        vscode.window.showInformationMessage(`网络服务已启动，监听端口 ${port}`);
+        return true;
+    } catch (error) {
+        const detail = error instanceof Error ? error.message : String(error);
+        logError('启动网络服务失败:', detail);
+        offerOpenPortSetting(`启动网络服务失败: ${detail}`);
+        return false;
+    }
+}
+
+/** 停止网络服务 */
+export function stopNetwork(): void {
+    networkService.stop();
+    vscode.window.showInformationMessage('网络服务已停止');
+}
+
+/** 弹出错误提示，并提供直达端口设置的入口（不阻塞调用方） */
+function offerOpenPortSetting(message: string): void {
+    const openSettings = '打开设置';
+    void vscode.window.showErrorMessage(message, openSettings).then(pick => {
+        if (pick === openSettings) {
+            void vscode.commands.executeCommand('workbench.action.openSettings', 'oschat.port');
+        }
+    });
+}

@@ -4,6 +4,7 @@ import { SettingsPanel } from './settingsPanel';
 import { PeersManager } from './peersManager';
 import { networkService } from './networkService';
 import { PeersEditor } from './peersEditor';
+import { startNetworkFromConfig, stopNetwork } from './networkLauncher';
 import { setLogSink, log } from './logger';
 import { getBuildHash } from './buildInfo';
 
@@ -63,49 +64,19 @@ export function activate(context: vscode.ExtensionContext) {
         chatProvider.refresh();
     });
 
-    // 启动网络服务
-    const config = vscode.workspace.getConfiguration('oschat');
-    const port = config.get('port', 8080);
-    const nickname = config.get('nickname', '');
-    const autoConnect = config.get('autoConnect', false);
-    const peersFilePath = peersManager.getPeersFilePath();
-
-    if (autoConnect) {
-        startNetworkService(port, nickname, peersFilePath);
+    // 自动启动网络服务（读取最新配置，不阻塞激活）
+    if (vscode.workspace.getConfiguration('oschat').get<boolean>('autoConnect', true)) {
+        void startNetworkFromConfig(peersManager);
     }
 
-    // 注册启动网络服务的命令
+    // 注册启动网络服务的命令：端口、昵称统一来自设置，运行中再次执行即重启
     context.subscriptions.push(
-        vscode.commands.registerCommand('myChat.startNetwork', async () => {
-            const portInput = await vscode.window.showInputBox({
-                prompt: '请输入监听端口',
-                value: String(port),
-                validateInput: (value) => {
-                    const num = parseInt(value);
-                    if (isNaN(num) || num < 1 || num > 65535) {
-                        return '请输入有效的端口号码 (1-65535)';
-                    }
-                    return null;
-                }
-            });
-            
-            if (portInput) {
-                const nicknameInput = await vscode.window.showInputBox({
-                    prompt: '请输入你的昵称（可选）',
-                    value: nickname
-                });
-                
-                await startNetworkService(parseInt(portInput), nicknameInput || '', peersFilePath);
-            }
-        })
+        vscode.commands.registerCommand('myChat.startNetwork', () => startNetworkFromConfig(peersManager))
     );
 
     // 注册停止网络服务的命令
     context.subscriptions.push(
-        vscode.commands.registerCommand('myChat.stopNetwork', () => {
-            networkService.stop();
-            vscode.window.showInformationMessage('网络服务已停止');
-        })
+        vscode.commands.registerCommand('myChat.stopNetwork', () => stopNetwork())
     );
 
     // 注册编辑聊天对象的命令
@@ -128,30 +99,30 @@ export function activate(context: vscode.ExtensionContext) {
     );
 
     // 监听配置更改
+    let restartPromptOpen = false;
     context.subscriptions.push(
         vscode.workspace.onDidChangeConfiguration(e => {
             if (e.affectsConfiguration('oschat.peersFilePath')) {
                 peersManager.refreshFilePath();
                 chatProvider.refresh();
             }
+            // 端口与昵称只在启动时读取：服务运行中被修改时提示重启（一次保存多项设置只提示一次）
+            if ((e.affectsConfiguration('oschat.port') || e.affectsConfiguration('oschat.nickname'))
+                && networkService.isRunning() && !restartPromptOpen) {
+                restartPromptOpen = true;
+                const restart = '立即重启';
+                void vscode.window.showInformationMessage('OS Chat 的端口或昵称已更改，需要重启网络服务才能生效。', restart)
+                    .then(pick => {
+                        restartPromptOpen = false;
+                        if (pick === restart) {
+                            void startNetworkFromConfig(peersManager);
+                        }
+                    });
+            }
         })
     );
 
     console.log(`OS Chat 已激活`);
-}
-
-async function startNetworkService(port: number, nickname: string, peersFilePath: string): Promise<void> {
-    try {
-        await networkService.start(port, nickname, peersFilePath);
-        vscode.window.showInformationMessage(`网络服务已启动，监听端口 ${port}`);
-        
-        // 保存配置
-        const config = vscode.workspace.getConfiguration('oschat');
-        await config.update('port', port, vscode.ConfigurationTarget.Global);
-        await config.update('nickname', nickname, vscode.ConfigurationTarget.Global);
-    } catch (error) {
-        vscode.window.showErrorMessage(`启动网络服务失败: ${error}`);
-    }
 }
 
 export function deactivate() {
