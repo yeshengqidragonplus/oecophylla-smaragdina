@@ -19,7 +19,9 @@
     "onCommand:myChat.stopNetwork",
     "onCommand:myChat.editPeers",
     "onCommand:myChat.openPeersFile",
-    "onCommand:myChat.showLogs"
+    "onCommand:myChat.showLogs",
+    "onCommand:myChat.diagnose",
+    "onCommand:myChat.scanSubnet"
   ],
   "extensionKind": [
     "ui"
@@ -94,6 +96,18 @@
         "title": "显示日志",
         "category": "OS Chat",
         "icon": "$(output)"
+      },
+      {
+        "command": "myChat.diagnose",
+        "title": "运行诊断（找不到对方时使用）",
+        "category": "OS Chat",
+        "icon": "$(pulse)"
+      },
+      {
+        "command": "myChat.scanSubnet",
+        "title": "扫描网段（广播被过滤时使用）",
+        "category": "OS Chat",
+        "icon": "$(search)"
       }
     ],
     "menus": {

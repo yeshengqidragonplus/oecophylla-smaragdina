@@ -263,3 +263,46 @@ export function broadcastTargets(list: LanInterface[]): string[] {
     targets.add('255.255.255.255');
     return Array.from(targets);
 }
+
+/** 被硬排除的 IPv4 地址及原因（回环不列出），供诊断展示"为什么这块网卡没被使用" */
+export function listExcludedInterfaces(raw: RawInterfaces = os.networkInterfaces() as RawInterfaces): Array<{ name: string; address: string; reason: string }> {
+    const excluded: Array<{ name: string; address: string; reason: string }> = [];
+    for (const name of Object.keys(raw)) {
+        for (const addr of raw[name] ?? []) {
+            if (!isIPv4(addr.family) || addr.internal) {
+                continue;
+            }
+            const reason = hardExcludeReason(addr);
+            if (reason !== null) {
+                excluded.push({ name, address: addr.address, reason });
+            }
+        }
+    }
+    return excluded;
+}
+
+/**
+ * 枚举网段内的主机地址（不含网络地址、广播地址与本机地址），用于手动"扫描网段"。
+ * 主机数超过 limit 时返回 null（如 /16 有 65534 个主机，不应逐个探测）。
+ */
+export function enumerateHosts(ip: string, mask: string, limit: number): string[] | null {
+    const ipValue = ipToInt(ip);
+    const maskValue = ipToInt(mask);
+    const prefix = maskToPrefix(mask);
+    if (ipValue === null || maskValue === null || prefix < 0 || prefix >= 31) {
+        return [];
+    }
+    const hostCount = Math.pow(2, 32 - prefix) - 2;
+    if (hostCount > limit) {
+        return null;
+    }
+    const network = (ipValue & maskValue) >>> 0;
+    const hosts: string[] = [];
+    for (let offset = 1; offset <= hostCount; offset++) {
+        const value = (network + offset) >>> 0;
+        if (value !== ipValue) {
+            hosts.push(intToIp(value));
+        }
+    }
+    return hosts;
+}

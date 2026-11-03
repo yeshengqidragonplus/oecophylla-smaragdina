@@ -87,3 +87,38 @@ suite('NetworkService：运行状态与唤醒检测', () => {
         }
     });
 });
+
+suite('NetworkService：手动扫描网段', () => {
+    suiteSetup(() => setConsoleEnabled(false));
+    suiteTeardown(() => setConsoleEnabled(true));
+
+    test('只在服务运行时可用', async () => {
+        const service = new NetworkService();
+        await assert.rejects(() => service.scanSubnets(), /未运行/);
+    });
+
+    test('向真实网卡所在网段的每个主机地址单播探测（目标端口为本机主端口），不含本机、网络地址与广播地址', async function () {
+        const service = new NetworkService();
+        const port = randomBasePort();
+        await service.start(port);
+        try {
+            const real = service.getLanInterfaces().filter(i => !i.virtual && i.prefix >= 22);
+            if (real.length === 0) {
+                this.skip(); // 当前环境没有可扫描的真实局域网网卡
+            }
+            const sent: Array<{ ip: string; port: number }> = [];
+            (service as unknown as { _udpSend(b: Buffer, p: number, ip: string, scope: string): void })._udpSend =
+                (_buffer, targetPort, ip) => { sent.push({ ip, port: targetPort }); };
+
+            const result = await service.scanSubnets();
+            assert.ok(result.scanned > 0);
+            assert.strictEqual(sent.length, result.scanned);
+            assert.ok(sent.every(t => t.port === port));
+            const own = real[0];
+            assert.ok(!sent.some(t => t.ip === own.address), '不应探测本机地址');
+            assert.ok(!sent.some(t => t.ip === own.broadcast), '不应探测广播地址');
+        } finally {
+            service.stop();
+        }
+    });
+});

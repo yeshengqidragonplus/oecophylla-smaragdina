@@ -5,6 +5,7 @@ import { PeersManager } from './peersManager';
 import { networkService } from './core/networkService';
 import { PeersEditor } from './peersEditor';
 import { initNetworkIdentity, startNetworkFromConfig, stopNetwork } from './networkLauncher';
+import { scanSubnet, showDiagnostics } from './diagnose';
 import { setLogSink, log } from './core/logger';
 import { getBuildHash } from './core/buildInfo';
 
@@ -64,6 +65,12 @@ export function activate(context: vscode.ExtensionContext) {
     // 注册停止网络服务的命令
     context.subscriptions.push(
         vscode.commands.registerCommand('myChat.stopNetwork', () => stopNetwork())
+    );
+
+    // 诊断与手动扫描网段
+    context.subscriptions.push(
+        vscode.commands.registerCommand('myChat.diagnose', () => showDiagnostics(context)),
+        vscode.commands.registerCommand('myChat.scanSubnet', () => scanSubnet())
     );
 
     // 注册编辑聊天对象的命令

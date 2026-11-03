@@ -10,6 +10,7 @@ import {
     LanInterface,
     RawInterfaces,
     broadcastTargets,
+    enumerateHosts,
     interfaceFingerprint,
     listLanInterfaces,
     listLocalAddresses,
@@ -120,6 +121,11 @@ const DISCOVERY_PORT = 41320;
 const FILE_CHUNK_SIZE = 64 * 1024;
 /** KCP 握手建连超时（毫秒） */
 const CONNECT_TIMEOUT = 5_000;
+/** 手动扫描网段：单个网段最多探测的主机数（/22 为 1022；更大的网段不扫） */
+const SCAN_HOST_LIMIT = 1022;
+/** 手动扫描网段：每批探测的主机数与批间间隔，避免瞬间发出上千个包 */
+const SCAN_BATCH_SIZE = 64;
+const SCAN_BATCH_DELAY = 20;
 
 export class NetworkService extends events.EventEmitter {
     private _udpServer: dgram.Socket | null = null;
@@ -139,6 +145,7 @@ export class NetworkService extends events.EventEmitter {
     private _lastTickAt: number = 0;
     private _state: NetworkStatus['state'] = 'stopped';
     private _stateError: string | undefined;
+    private _scanning: boolean = false;
     private _isRunning: boolean = false;
     private _transferTasks: Map<string, TransferTask> = new Map();
     private _transport: KcpTransport | null = null;
@@ -938,6 +945,53 @@ export class NetworkService extends events.EventEmitter {
             meta: rec.meta,
             manual: rec.manual
         }));
+    }
+
+    /**
+     * 手动扫描网段：向本机每块真实网卡所在网段的每个主机地址单播一个发现请求（目标端口为本机主端口）。
+     * 用于广播被过滤的网络——对方收到后会应答并登记我们，应答到达后会出现在联系人里。
+     * 只扫主机数不超过 1022 的网段（/22 及更小）；虚拟网卡与本机地址不扫。
+     */
+    public async scanSubnets(): Promise<{ scanned: number; interfaces: string[]; skipped: string[] }> {
+        if (!this._udpServer || !this._isRunning) {
+            throw new Error('网络服务未运行');
+        }
+        if (this._scanning) {
+            throw new Error('正在扫描中，请稍候');
+        }
+        this._scanning = true;
+        try {
+            const interfaces: string[] = [];
+            const skipped: string[] = [];
+            const targets = new Set<string>();
+            for (const iface of this._lanInterfaces) {
+                if (iface.virtual) {
+                    continue;
+                }
+                const hosts = enumerateHosts(iface.address, iface.netmask, SCAN_HOST_LIMIT);
+                const label = `${iface.name} ${iface.address}/${iface.prefix}`;
+                if (hosts === null) {
+                    skipped.push(`${label}（网段过大，超过 ${SCAN_HOST_LIMIT} 个主机）`);
+                    continue;
+                }
+                interfaces.push(label);
+                hosts.forEach(h => targets.add(h));
+            }
+
+            const buffer = Buffer.from(JSON.stringify(this._baseMessage('discovery_request')));
+            const list = Array.from(targets);
+            log(`[扫描] 向 ${list.length} 个地址发送单播探测（端口 ${this._port}，网卡：${interfaces.join('；') || '无'}）`);
+            for (let i = 0; i < list.length; i += SCAN_BATCH_SIZE) {
+                if (!this._isRunning) {
+                    break;
+                }
+                list.slice(i, i + SCAN_BATCH_SIZE).forEach(ip => this._udpSend(buffer, this._port, ip, 'scan'));
+                await new Promise<void>(resolve => setTimeout(resolve, SCAN_BATCH_DELAY));
+            }
+            return { scanned: list.length, interfaces, skipped };
+        } finally {
+            this._scanning = false;
+        }
     }
 
     /** 本实例的稳定实例 ID（`${machineId}:${端口}`），服务未启动时为空 */

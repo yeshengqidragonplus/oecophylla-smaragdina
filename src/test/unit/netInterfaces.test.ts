@@ -4,10 +4,12 @@ import {
     RawInterfaces,
     broadcastTargets,
     computeBroadcast,
+    enumerateHosts,
     hardExcludeReason,
     interfaceFingerprint,
     ipToInt,
     intToIp,
+    listExcludedInterfaces,
     listLanInterfaces,
     listLocalAddresses,
     maskToPrefix,
@@ -184,5 +186,34 @@ suite('netInterfaces：派生函数', () => {
             eth0: [addr('192.168.1.11', '255.255.255.0', '08:bf:b8:11:22:33')]
         }));
         assert.notStrictEqual(a, changed);
+    });
+});
+
+suite('netInterfaces：诊断与扫描辅助', () => {
+    test('listExcludedInterfaces：列出被排除的网卡与原因（回环不列出）', () => {
+        const excluded = listExcludedInterfaces(MAC_FIXTURE);
+        assert.deepStrictEqual(excluded.map(e => e.name), ['utun1500']);
+        assert.ok(excluded[0].reason.includes('198.18'));
+    });
+
+    test('enumerateHosts：/24 共 253 个目标（去掉网络地址、广播地址与本机）', () => {
+        const hosts = enumerateHosts('192.168.1.10', '255.255.255.0', 1022)!;
+        assert.strictEqual(hosts.length, 253);
+        assert.ok(!hosts.includes('192.168.1.10'));
+        assert.ok(!hosts.includes('192.168.1.0'));
+        assert.ok(!hosts.includes('192.168.1.255'));
+        assert.strictEqual(hosts[0], '192.168.1.1');
+    });
+
+    test('enumerateHosts：/22 共 1021 个目标，覆盖整个 10.10.212.0–10.10.215.255 网段', () => {
+        const hosts = enumerateHosts('10.10.213.120', '255.255.252.0', 1022)!;
+        assert.strictEqual(hosts.length, 1021);
+        assert.strictEqual(hosts[0], '10.10.212.1');
+        assert.strictEqual(hosts[hosts.length - 1], '10.10.215.254');
+    });
+
+    test('enumerateHosts：主机数超过上限返回 null，/31 /32 返回空', () => {
+        assert.strictEqual(enumerateHosts('10.1.2.3', '255.255.0.0', 1022), null);
+        assert.deepStrictEqual(enumerateHosts('10.1.2.3', '255.255.255.255', 1022), []);
     });
 });
