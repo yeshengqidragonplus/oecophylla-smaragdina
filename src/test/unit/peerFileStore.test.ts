@@ -2,7 +2,7 @@ import * as assert from 'assert';
 import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
-import { PeerFileStore, mergePeers } from '../../peerFileStore';
+import { PeerFileStore, mergePeers } from '../../core/peerFileStore';
 
 interface P { id: string; ip: string; port: number }
 

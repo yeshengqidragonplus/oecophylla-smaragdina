@@ -2,9 +2,9 @@ import * as vscode from 'vscode';
 import * as fs from 'fs';
 import * as path from 'path';
 import { PeersManager } from './peersManager';
-import { log, logError } from './logger';
-import { getBuildHash } from './buildInfo';
-import { networkService, NetworkMessage, TransferTask } from './networkService';
+import { log, logError } from './core/logger';
+import { getBuildHash } from './core/buildInfo';
+import { networkService, NetworkMessage, TransferTask } from './core/networkService';
 import { startNetworkFromConfig, stopNetwork } from './networkLauncher';
 
 interface ChatMessage {

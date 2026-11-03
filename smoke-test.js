@@ -2,7 +2,7 @@
 const fs = require('fs');
 const path = require('path');
 const os = require('os');
-const { NetworkService } = require('./out/networkService');
+const { NetworkService } = require('./out/core/networkService');
 
 async function main() {
     const a = new NetworkService();

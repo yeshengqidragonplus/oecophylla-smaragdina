@@ -3,7 +3,7 @@ import * as os from 'os';
 import * as path from 'path';
 import * as vscode from 'vscode';
 import { PeersManager } from '../peersManager';
-import { NetworkService, PeerInfo, NetworkMessage, TransferTask } from '../networkService';
+import { NetworkService, PeerInfo, NetworkMessage, TransferTask } from '../core/networkService';
 
 suite('Extension Test Suite', () => {
     vscode.window.showInformationMessage('Start all tests.');

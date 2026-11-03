@@ -1,7 +1,7 @@
 import * as vscode from 'vscode';
-import { networkService } from './networkService';
+import { networkService } from './core/networkService';
 import { PeersManager } from './peersManager';
-import { logError } from './logger';
+import { logError } from './core/logger';
 
 const MIN_PORT = 1024;
 /** 业务端口 = 主端口 + 1000，必须不超过 65535 */

@@ -1,6 +1,6 @@
 import * as vscode from 'vscode';
 import * as path from 'path';
-import { PeerFileStore, mergePeers } from './peerFileStore';
+import { PeerFileStore, mergePeers } from './core/peerFileStore';
 
 export interface StoredPeerInfo {
     id: string;

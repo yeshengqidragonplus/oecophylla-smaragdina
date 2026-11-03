@@ -2,11 +2,11 @@ import * as vscode from 'vscode';
 import { ChatViewProvider } from './chatViewProvider';
 import { SettingsPanel } from './settingsPanel';
 import { PeersManager } from './peersManager';
-import { networkService } from './networkService';
+import { networkService } from './core/networkService';
 import { PeersEditor } from './peersEditor';
 import { startNetworkFromConfig, stopNetwork } from './networkLauncher';
-import { setLogSink, log } from './logger';
-import { getBuildHash } from './buildInfo';
+import { setLogSink, log } from './core/logger';
+import { getBuildHash } from './core/buildInfo';
 
 let chatProvider: ChatViewProvider;
 let peersManager: PeersManager;
@@ -49,8 +49,8 @@ export function activate(context: vscode.ExtensionContext) {
     );
 
     // 监听网络服务的 peer 更新事件
-    networkService.on('peersUpdate', (peers: import('./networkService').PeerInfo[]) => {
-        peers.forEach((peer: import('./networkService').PeerInfo) => {
+    networkService.on('peersUpdate', (peers: import('./core/networkService').PeerInfo[]) => {
+        peers.forEach((peer: import('./core/networkService').PeerInfo) => {
             peersManager.updatePeer({
                 id: peer.id,
                 hostname: peer.hostname,
