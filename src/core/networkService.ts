@@ -14,6 +14,7 @@ import {
     listLocalAddresses,
     pickPrimary
 } from './netInterfaces';
+import { ProbeState, isProbeDue, nextProbeState } from './probeSchedule';
 
 export interface PeerInfo {
     id: string;
@@ -65,8 +66,8 @@ export interface TransferTask {
 
 /** 心跳超时（毫秒），超过此时间未收到心跳则标记离线 */
 const HEARTBEAT_TIMEOUT = 90_000;
-/** 心跳发送间隔（毫秒） */
-const HEARTBEAT_INTERVAL = 30_000;
+/** 对端维护节拍（毫秒）：每个节拍检查离线超时，并探测到期的对端（探测节奏见 probeSchedule） */
+const PEER_TICK_INTERVAL = 5_000;
 /** 广播发现间隔（毫秒） */
 const DISCOVERY_INTERVAL = 30_000;
 /** 启动后的快速补发时机（毫秒）：对端可能刚好还没绑定发现端口，不必干等一个完整周期 */
@@ -105,7 +106,9 @@ export class NetworkService extends events.EventEmitter {
     /** 测试开关：关闭广播发现，用于验证单播探测不依赖广播 */
     private _broadcastEnabled: boolean = true;
 
-    private _heartbeatIntervalTimer: NodeJS.Timeout | null = null;
+    private _peerTickTimer: NodeJS.Timeout | null = null;
+    /** 每个对端的探测状态：key 为 peerId */
+    private _probeState: Map<string, ProbeState> = new Map();
     private _discoveryIntervalTimer: NodeJS.Timeout | null = null;
 
     /** 网络错误日志限流（断网时每个 UDP 包都会失败，不能每条都写日志） */
@@ -173,7 +176,7 @@ export class NetworkService extends events.EventEmitter {
             this._sendDiscoveryBroadcast();
         }, DISCOVERY_INTERVAL);
 
-        this._startHeartbeat();
+        this._startPeerTick();
     }
 
     private _startUdpServer(port: number): Promise<void> {
@@ -336,43 +339,51 @@ export class NetworkService extends events.EventEmitter {
     // ==================== 心跳检测 ====================
 
     /**
-     * 启动心跳定时器
+     * 启动对端维护节拍，并立即探测一轮（启动时已加载的对端无需等第一个节拍）
      */
-    private _startHeartbeat(): void {
-        if (this._heartbeatIntervalTimer) {
-            clearInterval(this._heartbeatIntervalTimer);
+    private _startPeerTick(): void {
+        if (this._peerTickTimer) {
+            clearInterval(this._peerTickTimer);
         }
-
-        this._heartbeatIntervalTimer = setInterval(() => {
-            this._sendHeartbeats();
+        this._peerTickTimer = setInterval(() => {
             this._checkPeerLiveness();
-        }, HEARTBEAT_INTERVAL);
+            this._probePeers();
+        }, PEER_TICK_INTERVAL);
+        this._probePeers();
     }
 
     /**
-     * 向所有已知 peer 发送心跳
+     * 探测所有已知对端（不再看 lastSeen）：
+     * 在线的发心跳；离线的发单播发现请求——对方收到会回应并登记我们，
+     * 这是广播到不了（跨网段、广播被过滤）时找回手工配置对端的唯一途径。
      */
-    private _sendHeartbeats(): void {
+    private _probePeers(): void {
         if (!this._udpServer || !this._isRunning) {
             return;
         }
-
         const now = Date.now();
-        this._peers.forEach((peer) => {
-            // 只向在线或刚离线不久的 peer 发送心跳
-            if (peer.status === 'online' || (now - peer.lastSeen < HEARTBEAT_TIMEOUT * 2)) {
-                const heartbeat: NetworkMessage = {
-                    type: 'heartbeat',
-                    from: this.getLocalIp(),
-                    fromHostname: this._hostname,
-                    fromNickname: this._nickname,
-                    to: peer.id,
-                    timestamp: now,
-                    transferPort: this._transport?.port || (this._port + 1000)
-                };
-                this._sendTo(peer.ip, peer.port, heartbeat);
+        this._peers.forEach(peer => {
+            const online = peer.status === 'online';
+            const state = this._probeState.get(peer.id);
+            if (!isProbeDue(online, state, now)) {
+                return;
             }
+            this._probeState.set(peer.id, nextProbeState(online, state, now));
+            this._sendProbe(peer, online ? 'heartbeat' : 'discovery_request');
         });
+    }
+
+    private _sendProbe(peer: PeerInfo, type: 'heartbeat' | 'discovery_request'): void {
+        const message: NetworkMessage = {
+            type,
+            from: this.getLocalIp(),
+            fromHostname: this._hostname,
+            fromNickname: this._nickname,
+            to: peer.id,
+            timestamp: Date.now(),
+            transferPort: this._transport?.port || (this._port + 1000)
+        };
+        this._sendTo(peer.ip, peer.port, message);
     }
 
     /**
@@ -494,10 +505,11 @@ export class NetworkService extends events.EventEmitter {
     public stop(): void {
         this._isRunning = false;
 
-        if (this._heartbeatIntervalTimer) {
-            clearInterval(this._heartbeatIntervalTimer);
-            this._heartbeatIntervalTimer = null;
+        if (this._peerTickTimer) {
+            clearInterval(this._peerTickTimer);
+            this._peerTickTimer = null;
         }
+        this._probeState.clear();
         if (this._discoveryIntervalTimer) {
             clearInterval(this._discoveryIntervalTimer);
             this._discoveryIntervalTimer = null;
