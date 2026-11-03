@@ -102,7 +102,6 @@ export class SettingsPanel {
         nickname: string;
         peersFilePath: string;
         downloadPath: string;
-        theme: string
     }): Promise<void> {
         const config = vscode.workspace.getConfiguration('oschat');
         await config.update('port', settings.port, vscode.ConfigurationTarget.Global);
@@ -110,8 +109,6 @@ export class SettingsPanel {
         await config.update('nickname', settings.nickname, vscode.ConfigurationTarget.Global);
         await config.update('peersFilePath', settings.peersFilePath, vscode.ConfigurationTarget.Global);
         await config.update('downloadPath', settings.downloadPath, vscode.ConfigurationTarget.Global);
-        await config.update('theme', settings.theme, vscode.ConfigurationTarget.Global);
-        
         vscode.window.showInformationMessage('设置已保存');
     }
 
@@ -135,8 +132,7 @@ export class SettingsPanel {
         const nickname = config.get('nickname', '');
         const peersFilePathConfig = config.get<string>('peersFilePath', '');
         const downloadPath = config.get('downloadPath', '');
-        const theme = config.get('theme', 'default');
-        
+
         // 计算实际的 peers.json 路径
         let peersFilePath: string;
         if (peersFilePathConfig) {
@@ -156,8 +152,7 @@ export class SettingsPanel {
             autoConnect,
             nickname,
             peersFilePath,
-            downloadPath,
-            theme
+            downloadPath
         );
     }
 
@@ -166,8 +161,7 @@ export class SettingsPanel {
         autoConnect: boolean,
         nickname: string,
         peersFilePath: string,
-        downloadPath: string,
-        theme: string
+        downloadPath: string
     ): string {
         const nonce = this._getNonce();
 
@@ -326,7 +320,7 @@ export class SettingsPanel {
         
         <div class="setting-item">
             <label class="setting-label" for="port">监听端口</label>
-            <input type="number" id="port" class="setting-input port-input" value="${port}" min="1" max="65535" placeholder="8080">
+            <input type="number" id="port" class="setting-input port-input" value="${port}" min="1024" max="64535" placeholder="8080">
             <div class="setting-description">用于接收局域网内其他主机发送的广播消息的 UDP 端口</div>
         </div>
         
@@ -371,21 +365,6 @@ export class SettingsPanel {
         </div>
     </div>
     
-    <div class="setting-group">
-        <h2><span class="section-icon">🎨</span>外观设置</h2>
-        
-        <div class="setting-item">
-            <label class="setting-label" for="theme">主题</label>
-            <div class="select-wrapper">
-                <select id="theme">
-                    <option value="default" ${theme === 'default' ? 'selected' : ''}>默认（跟随 VS Code）</option>
-                    <option value="light" ${theme === 'light' ? 'selected' : ''}>浅色</option>
-                    <option value="dark" ${theme === 'dark' ? 'selected' : ''}>深色</option>
-                </select>
-            </div>
-        </div>
-    </div>
-    
     <button class="save-btn" id="saveBtn">保存设置</button>
 
     <script nonce="${nonce}">
@@ -419,13 +398,12 @@ export class SettingsPanel {
                 autoConnect: document.getElementById('autoConnect').checked,
                 nickname: document.getElementById('nickname').value,
                 peersFilePath: document.getElementById('peersFilePath').value,
-                downloadPath: document.getElementById('downloadPath').value,
-                theme: document.getElementById('theme').value
+                downloadPath: document.getElementById('downloadPath').value
             };
             
             // 验证端口
-            if (settings.port < 1 || settings.port > 65535) {
-                alert('端口号必须在 1-65535 之间');
+            if (settings.port < 1024 || settings.port > 64535) {
+                alert('端口号必须在 1024-64535 之间（业务端口为主端口 + 1000）');
                 return;
             }
             
