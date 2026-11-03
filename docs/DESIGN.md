@@ -43,38 +43,44 @@
 
 - **UDP 只负责"谁在线"**：广播发现、心跳、在线/离线判定。UDP 不可靠没关系——丢一两个心跳不影响正确性。
 - **KCP 负责"说什么"**：聊天消息和文件全部走 KCP（`src/kcp.ts`，ikcp.c 的纯 TypeScript 移植：选择重传、快速重传、RTO、滑动窗口、拥塞控制）。可靠、有序、自带流控，文件分块无需自己实现重传。
-- 身份标识 **peerId = `ip:主UDP端口`**。KCP 端口不直接参与身份，通过 UDP 消息的 `transferPort` 字段告知对端（默认为主端口 + 1000）。
+- 身份标识是稳定的**实例 ID**（`iid` = `机器标识:主UDP端口`，机器标识首次运行时生成并保存在全局状态里，之后不变）。IP 只是"最近一次观察到的地址"：DHCP 换 IP 只更新地址，不会出现同一台机器的多个联系人。旧版对端没有 `iid`，退回使用 `ip:端口`。
+- KCP 端口通过 UDP 消息的 `transferPort` 字段告知对端（默认为主端口 + 1000）。
 
 > 历史决策：早期版本使用 kcpjs 库承载业务消息，但 kcpjs 依赖原生模块（需要 C++ 工具链编译），一度替换为 Node 内置 `net`（TCP）。现按 UDP+KCP 的预期架构回归，KCP 协议改为项目内纯 TypeScript 实现（`src/kcp.ts`，零原生依赖），不再有编译问题。
 
 ### 2.2 模块与数据流
 
 ```
-                        ┌────────────────┐
-   网络事件（EventEmitter）│ networkService │◄──── KcpTransport（由它创建并持有）
-                        └───────┬────────┘
-                                │ peersUpdate / message / transferTask*
-                                ▼
-                        ┌────────────────┐
-                        │  extension.ts  │  入口：注册 myChat.* 命令、桥接事件
-                        └───┬────────┬───┘
-                            │        │
-              updatePeer()  ▼        ▼  refresh() / 收消息入会话
-                   ┌──────────────┐ ┌──────────────────┐
-                   │ PeersManager │ │ ChatViewProvider │──postMessage──► Webview UI
-                   │ (peers.json) │ │  (侧边栏视图)      │
-                   └──────────────┘ └──────────────────┘
+        不依赖 vscode 的 core 层                          vscode 适配层
+ ┌──────────────────────────────────────┐
+ │ networkService（单例，EventEmitter）    │──peersUpdate / statusChange / message / transferTask*──┐
+ │   ├ KcpTransport（业务通道）            │                                                        ▼
+ │   ├ PeerRegistry（对端唯一数据源）       │◄──读写──  PeersManager（peers.json 持久化、联系人视图） ──► ChatViewProvider ──► Webview
+ │   ├ netInterfaces（网卡与广播）          │                                                        ▲
+ │   └ probeSchedule / netErrors           │            extension.ts（装配）· networkLauncher · statusBar · diagnose
+ └──────────────────────────────────────┘
 ```
+
+`src/core/` 下的模块**不得 import `vscode`**，可在 VS Code 之外运行与测试（`smoke-test.js`、`npm run test:unit`）。
 
 | 模块 | 职责 |
 |---|---|
-| `src/networkService.ts` | 模块级单例（`export const networkService`），EventEmitter。UDP 发现/心跳、peer 表维护、传输任务（TransferTask）编排、文件分块发送 |
-| `src/kcp.ts` | KCP 协议核心（ikcp.c 纯 TS 移植，ARQ，无 FEC，零依赖） |
-| `src/kcpTransport.ts` | KCP 业务通道：专用 UDP socket、SYN/ACK 握手、conv 路由、帧编解码、会话表（peerId → KCP 会话） |
-| `src/extension.ts` | 插件入口：注册 `myChat.*` 命令、把 networkService 事件接到 PeersManager 与 ChatViewProvider、按 `oschat.autoConnect` 自动启动 |
-| `src/chatViewProvider.ts` | 侧边栏 Webview（视图 ID `OSChatView`）：会话/消息管理、文件接收重组与进度、HTML 界面内联生成 |
-| `src/peersManager.ts` | 聊天对象持久化（peers.json，带写盘防抖） |
-| `src/peersEditor.ts` / `src/settingsPanel.ts` | peers 编辑、设置的独立 Webview 面板 |
+| `core/networkService.ts` | 模块级单例（`export const networkService`），EventEmitter。UDP 发现/探测、传输任务（TransferTask）编排、文件分块发送、运行状态（`statusChange`）、唤醒与网卡变化检测、手动扫描网段 |
+| `core/peerRegistry.ts` | **对端唯一数据源**：身份（iid / 别名）、地址、在线三态、合并与清理；`peers.json` 的内存模型 |
+| `core/netInterfaces.ts` | 网卡枚举与过滤（硬排除 / 虚拟网卡降级）、按掩码位运算算广播地址、网卡指纹 |
+| `core/probeSchedule.ts` | 对端探测节奏与睡眠唤醒判定（纯函数） |
+| `core/netErrors.ts` | socket 错误分类（按系统给出建议）与日志限流 |
+| `core/diagnostics.ts` | 诊断报告与初步判断规则 |
+| `core/kcp.ts` | KCP 协议核心（ikcp.c 纯 TS 移植，ARQ，无 FEC，零依赖） |
+| `core/kcpTransport.ts` | KCP 业务通道：专用 UDP socket、SYN/ACK/FIN/RST 控制报文、会话仲裁、conv 路由、帧编解码、会话表 |
+| `core/peerFileStore.ts` | `peers.json` 读写：读不出可信内容时不写盘，原子写盘 |
+| `core/logger.ts` / `core/buildInfo.ts` | 日志与构建指纹 |
+| `src/extension.ts` | 插件入口：注册命令、装配各模块、按 `oschat.autoConnect` 自动启动 |
+| `src/networkLauncher.ts` | 启动/停止网络服务的统一入口（命令面板、侧边栏、自动启动共用），负责本机标识与版本信息 |
+| `src/peersManager.ts` | 联系人持久化与视图：把 `PeerRegistry` 投影成界面用的联系人列表，防抖写 `peers.json` |
+| `src/chatViewProvider.ts` | 侧边栏 Webview（视图 ID `OSChatView`）：会话/消息管理、文件接收重组与进度、未读提醒、HTML 界面内联生成 |
+| `src/statusBar.ts` / `src/diagnose.ts` | 状态栏与标题栏启停切换；诊断与扫描网段命令 |
+| `src/peersEditor.ts` / `src/settingsPanel.ts` | 联系人编辑、设置的独立 Webview 面板（计划用原生设置替代） |
 
 ## 3. 线上协议
 
@@ -82,35 +88,62 @@
 
 | type | 通道 | 用途 |
 |---|---|---|
-| `discovery_request` | UDP 广播 → 41320 | 发现请求（携带本端 hostname/nickname/transferPort） |
-| `discovery_response` | UDP 单播 → 请求方主端口 | 发现应答 |
+| `discovery_request` | UDP 广播 → 41320；或单播 → 对端主端口 | 发现请求（携带本端 hostname/nickname/transferPort 与身份字段） |
+| `discovery_response` | UDP 单播 → 请求方主端口 | 发现应答（往返确认） |
 | `heartbeat` / `heartbeat_ack` | UDP 单播 | 心跳与确认，维护在线状态 |
-| `message` | KCP | 聊天文本（`content` 字段） |
+| `message` | KCP | 聊天文本（`content` 字段，`id` 用于去重） |
 | `file` | KCP | 文件分块（`file.{name,size,chunkIndex,totalChunks,data(base64)}`） |
+
+**协议 v2 的新增字段**（旧字段不变，旧版对端忽略未知字段，两端不必同时升级）：
+
+| 字段 | 含义 |
+|---|---|
+| `proto` | 协议版本，当前为 2 |
+| `iid` | 发送方实例 ID（`机器标识:主端口`），对端据此识别"还是同一台机器" |
+| `boot` | 发送方本次启动的随机标识；变化说明对端重启过，旧的 KCP 会话立即作废 |
+| `meta` | 系统、架构、Node、插件版本、构建指纹、VS Code 版本，用于联系人详情与排查 |
+| `id`（业务消息） | 消息 ID，接收端保留最近 512 个做去重（会话重建后的重发不会重复显示） |
+
+地址取自接收到的 UDP 包的来源地址（`rinfo`），**不取对端自称的 `from`**。
 
 ### 3.1 自动发现
 
-1. 启动时及之后每 **60 秒**，从 UDP 主 socket 向 `255.255.255.255:41320` 和子网广播地址发送 `discovery_request`。源端口即本端主端口，对方据此知道往哪回复。
-2. 所有实例都以 `reuseAddr` 共同绑定固定发现端口 **41320**——广播包会投递给同一端口的所有绑定者，因此**同一台机器上主端口不同的多个实例也能互相发现**（这是引入共享发现端口的原因；绑定失败不致命，只是无法被广播发现）。
-3. 收到请求方单播 `discovery_response` 回请求方主端口，双方据此互相登记/刷新 peer。
+1. 启动时立即广播一次，启动后 1 秒、3 秒各快速补发一次，之后每 **30 秒**一轮。每轮先刷新网卡信息，然后从 UDP 主 socket 向**每块可用局域网网卡的定向广播地址**和 `255.255.255.255` 的 41320 端口发送 `discovery_request`（广播地址按 `ip | ~mask` 位运算计算，/22 等非 /24 网段也正确）。源端口即本端主端口，对方据此知道往哪回复。
+2. 可用网卡 = 排除回环、`169.254` 链路本地、`198.18.0.0/15`（Clash/Surge 的 TUN）、`/31` `/32` 点对点链路、多播后的 IPv4 网卡；名称或 MAC 像虚拟网卡（Docker、WSL、VMware、VPN 等）的只降级、排在后面，不剔除——Hyper-V 外部交换机下真实网段就挂在 vEthernet 上。
+3. 所有实例都以 `reuseAddr` 共同绑定固定发现端口 **41320**——广播包会投递给同一端口的所有绑定者，因此**同一台机器上主端口不同的多个实例也能互相发现**（绑定失败不致命，只是无法被广播发现）。
+4. 收到请求方单播 `discovery_response` 回请求方主端口，双方据此互相登记/刷新对端。
+5. **持续单播探测**：对所有已知对端（含 `peers.json` 里手工配置的）持续探测，不看 `lastSeen`——有联系的发心跳，离线的发单播发现请求（前 3 次 30 秒一次，之后 60 秒一次）。这是广播到不了（跨网段、广播被过滤）时找回对端的唯一途径。
+6. **手动扫描网段**（`myChat.scanSubnet`，需确认）：向真实网卡所在网段（主机数 ≤ 1022，即 /22 及更小）的每个地址单播一个发现请求，分批发送。
 
-自消息过滤：比较 **IP + 端口**（`_isSelf`），只比较 IP 会误杀同机其他实例。
+自消息过滤：先看消息里的实例 ID，再比较 **IP + 端口**（`_isSelf`）；只比较 IP 会误杀同机其他实例。
 
-### 3.2 心跳与在线判定
+### 3.2 在线判定（三态）
 
-- 每 **30 秒**向在线（或刚离线不久）的 peer 单播 `heartbeat`，对方回 `heartbeat_ack`；任何 UDP 消息到达都会刷新该 peer 的 `lastSeen` 并置为在线。
-- 超过 **90 秒**未见任何消息 → 标记离线，触发 `peersUpdate`。
-- KCP 会话成功建立（`sessionConnected`）同样会把离线 peer 拉回在线——握手成功本身就是在线证明。
+在线状态由"**往返确认**"决定，而不是"收到过任意包"：
+
+| 状态 | 条件 | 含义 |
+|---|---|---|
+| online（🟢） | 90 秒内收到过往返确认（对方应答了我们的探测，或 KCP 握手成功）；或刚收到对方入站包、尚在 20 秒宽限期内 | 双向可达 |
+| oneway（🟡） | 90 秒内收到过对方的包，但宽限期后仍无往返确认 | 对方能找到我们，我们到对方可能被防火墙拦截 |
+| offline（⚪） | 90 秒内什么都没收到 | 离线 |
+
+- 每 **5 秒**一个维护节拍：重新计算状态、探测到期的对端（在线 30 秒一次心跳）。
+- **睡眠唤醒与网卡变化**：两次节拍间隔超过 10 秒（进程被挂起过）或网卡指纹变化时，销毁旧 KCP 会话、清空探测状态、立即重新广播并探测全部对端；该节拍不做离线判定，避免唤醒后一瞬间把所有对端误判为离线。
+- 在线状态**不写入 `peers.json`**，每次启动都从全部离线开始。
 
 ### 3.3 KCP 会话与帧协议
 
-- **数据报分型**：KCP 专用 UDP 端口上的每个数据报以 1 字节前缀区分——`0x01` 控制报文（JSON：`syn`/`ack`/`fin`），`0x02` KCP 报文（按 conv 路由到会话）。
-- **握手即身份**：发起方选随机 32 位 conv，发送 `{"t":"syn","conv":N,"id":"<发起方peerId>"}`，每 500ms 重发直至收到 `ack`（默认 5 秒超时）。握手自带 peerId，无需单独身份帧。
-- **双向同时建连仲裁**：A、B 可能同时向对方发起握手，产生两个冗余会话。约定 **发起方 peerId 字典序较小的会话胜出**，另一个销毁。双方独立执行此规则得到一致结果。
-- **帧格式**：KCP 可靠字节流之上，4 字节大端长度前缀 + JSON 负载。接收侧按前缀拆帧；单帧上限 64 MB，超限直接断会话防内存攻击。
-- **发送确认**：与 TCP 不同，KCP 入队即"成功"，因此 `send()` 等待发送队列被对端 ACK 清空才完成；确认无进展超过 5 秒 → 判定对端离线，销毁会话并报错（快速失败）。另有在途段数背压上限与 KCP 死链（单段重传 20 次）检测。
+- **数据报分型**：KCP 专用 UDP 端口上的每个数据报以 1 字节前缀区分——`0x01` 控制报文（JSON：`syn`/`ack`/`fin`/`rst`），`0x02` KCP 报文（按 conv 路由到会话）。
+- **握手即身份**：发起方选随机 32 位 conv，发送 `{"t":"syn","conv":N,"id":"<旧版 peerId>","iid":"<实例 ID>","boot":"<启动标识>","mp":<主端口>}`，每 500ms 重发直至收到 `ack`（默认 5 秒超时）。会话以实例 ID 为键，旧版对端没有 `iid` 时用 `id`。同一对端的并发 `connect` 共用一次握手。
+- **会话仲裁**（同一对端出现第二个 SYN 时）：
+  - 同一发起方换了 conv，或对端 `boot` 变了（进程重启过）→ 旧会话已无意义，**直接替换**；
+  - 双向同时建连（我们先发起、对端也发起）→ 发起方 id 字典序较小的会话胜出；此时若已有会话已建立，发一个长度为 0 的保活帧探测——对端若单边丢了会话会回 `rst`，销毁后对端的下一次 SYN 重发即可建连。
+- **RST**：收到未知 conv 的 KCP 报文时回复 `rst`（按来源与 conv 限流），发送方立即销毁僵尸会话并以 `SESSION_CLOSED` 快速失败，不再干等 5 秒确认超时。
+- **帧格式**：KCP 可靠字节流之上，4 字节大端长度前缀 + JSON 负载。接收侧按前缀拆帧；单帧上限 64 MB，超限直接断会话防内存攻击；长度为 0 的帧是保活，直接丢弃。
+- **发送确认**：与 TCP 不同，KCP 入队即"成功"，因此 `send()` 等待发送队列被对端 ACK 清空才完成；确认无进展超过 5 秒 → 判定对端离线，发 FIN、销毁会话并报错（快速失败）。另有在途段数背压上限与 KCP 死链（单段重传 20 次）检测。
+- **错误与重试**：传输层错误统一为带错误码的 `KcpError`（`NO_SESSION` / `SESSION_CLOSED` / `ACK_TIMEOUT` / `SEND_FAILED` / `CONNECT_TIMEOUT`）。会话失效类错误时，`networkService` 销毁旧会话、重建并重发一次，用户不必手动点第二次。
 - **在线检测即握手**：发送前不做额外探测，握手（5 秒超时）失败即视为对方不在线。
-- **KCP 参数**：极速模式（nodelay=1、10ms 时钟、快速重传阈值 2、关闭拥塞控制——内网场景），收发窗口 256。空闲超过 10 分钟的会话自动回收（心跳在主通道，业务通道允许静默）。
+- **KCP 参数**：极速模式（nodelay=1、10ms 时钟、快速重传阈值 2、关闭拥塞控制——内网场景），收发窗口 256，**MTU 1200**（VPN/TUN 下不被 IP 分片）。空闲超过 10 分钟的会话自动回收。
 
 ## 4. 文件传输
 
@@ -129,31 +162,39 @@
 
 ## 5. 会话与持久化
 
-- **会话归属**：收到的消息按发送方 peerId 归入对应会话（而非当前打开的会话）。
+- **会话归属**：收到的消息按发送方联系人的规范 id 归入对应会话（旧会话里保存的 `ip:端口` 等别名地址会自动对应到同一个联系人）。
 - **peers.json**（路径由 `oschat.peersFilePath` 配置，默认插件 globalStorage）：
-  - 启动时加载，所有加载的 peer 初始为离线；
-  - `updatePeer` 只在状态/地址/名称真正变化时标记写盘，`lastSeen` 仅内存更新；
-  - 写盘 **2 秒防抖**合并（心跳高频更新不反复写盘）；插件停用时 `flush()` 落盘未保存更改。
-- 聊天消息不持久化。
+  - 内存模型是 `PeerRegistry`，`PeersManager` 负责读写；记录含 `iid`、`aliases`（历史 id）、`manual`、`lastSeen`，**不含在线状态**；
+  - 启动时加载，所有对端初始为离线；旧格式文件（含 `status`、没有 `manual`/`iid`）兼容读取，旧条目视为手工添加；
+  - 自动发现的对端 30 天未见则清理，手工添加或编辑过的永不自动清理；
+  - **读不出可信内容时绝不写盘**：路径不可用（外接卷未挂载）期间不写，路径恢复后与文件内容合并再写；文件损坏时先备份为 `.corrupt-时间戳`，修复前不写；
+  - 写盘为"临时文件 + 重命名"的原子写，2 秒防抖；没有实质变化（只有在线状态、lastSeen 在变）时不写盘，`lastSeen` 在实质变化与插件停用时落盘。
+- **聊天会话**持久化在全局存储目录的 `chatSessions.json`（整份重写，后续里程碑改为增量存储）。
 
 ## 6. 配置项（`oschat.*`）
 
+所有设置都是 `machine` 级：不被 Settings Sync 同步到另一台机器，也不能被工作区设置覆盖。
+
 | 配置 | 默认 | 说明 |
 |---|---|---|
-| `port` | 8080 | UDP 主端口；KCP 业务端口（UDP）= 此值 + 1000 |
-| `nickname` | — | 昵称，随发现/心跳广播 |
-| `autoConnect` | false | 插件激活时自动启动网络服务 |
+| `port` | 8080 | UDP 主端口（1024–64535）；KCP 业务端口（UDP）= 此值 + 1000；另需放行固定的发现端口 41320。修改后需重启网络服务 |
+| `nickname` | — | 昵称，随发现/心跳广播；留空则使用计算机名。修改后需重启网络服务 |
+| `autoConnect` | true | VS Code 启动后自动启动网络服务（配合 `onStartupFinished` 激活） |
 | `peersFilePath` | — | peers.json 所在目录（空则用插件存储目录） |
 | `downloadPath` | — | 接收文件保存目录 |
-| `theme` | — | 界面主题 |
 
-命令：`myChat.startNetwork`（交互输入端口/昵称）、`myChat.stopNetwork`、`myChat.newChat`、`myChat.editPeers`、`myChat.openPeersFile`、`myChat.openSettings`。
+命令（category 均为 "OS Chat"）：`myChat.startNetwork`（读取最新设置，运行中再次执行即重启）、`myChat.stopNetwork`、`myChat.newChat`、`myChat.editPeers`、`myChat.openPeersFile`、`myChat.openSettings`、`myChat.showLogs`、`myChat.diagnose`（诊断报告）、`myChat.scanSubnet`（手动扫描网段）。
+
+扩展声明 `extensionKind: ["ui"]`：在 WSL / SSH / 容器等远程窗口里也在本机运行，网络行为与本机窗口一致。
 
 ## 7. 资源管理约定
 
 - 重建 KcpTransport 前必须先 `removeAllListeners()` + `stop()`（历史上有事件监听泄漏 bug）。
 - `NetworkService.start()` 失败时回滚已启动的部分（KCP 起来了但主 UDP 失败 → 先停 KCP 再抛错）。
 - `stop()` 清理顺序：定时器 → KcpTransport（关闭所有会话）→ UDP 主 socket → 发现 socket，最后将所有 peer 置离线并广播 `peersUpdate`。
+- **不得 `emit('error')`**：EventEmitter 对没有监听者的 `error` 事件会直接抛出。运行期 socket 错误一律走 `networkError` / `transportError` 事件，并经 `netErrors` 分类、限流记录。
+- **所有 UDP `send` 必须带回调**（含同步抛出的参数错误）；不带回调的发送失败会变成 socket 的未处理 `error` 事件。
+- socket 的 `error` 监听必须常驻（不用 `once`）。
 
 ## 8. 安全考量与已知限制
 
@@ -161,8 +202,12 @@
 - 接收文件名已做路径穿越防护（§4），这是唯一的输入硬化点之一；业务帧长度上限防止恶意超大帧。
 - 文件分块经 base64 编码（约 +33% 体积），换取协议统一为 JSON 帧的简单性；内网带宽下可接受。
 - 接收侧分块在内存中累积到收齐才写盘，超大文件会占用相应内存（与发送侧的流式读取不对称，已知权衡）。
+- 接收侧每收一块会同步重写整份 `chatSessions.json`，大文件传输时会阻塞扩展宿主（后续里程碑改为流式落盘与增量存储）。
+- 一帧最多 128 个 KCP 分片（约 150KB），超长的单条文本消息会发送失败；文件按 64KB 分块不受影响。
+- 仅支持 IPv4；同机第二个 VS Code 窗口会因 KCP 端口被占用而启动失败（守护进程方案见 DAEMON-DESIGN.md，尚未实现）。
 
 ## 9. 测试
 
-- 单元/集成测试：`src/test/`，`npm run test`（@vscode/test-cli + mocha）。
-- 端到端冒烟：`npm run compile-tests` 后 `node smoke-test.js`——同一台机器起两个 NetworkService 实例，验证发现、消息、分块文件、进度、离线检测，**不依赖 VS Code**。
+- **单元测试**（不启动 VS Code，反馈快）：`npm run test:unit`，位于 `src/test/unit/`，覆盖网卡与广播计算（含 Mac / 中文 Windows / Linux 夹具）、探测节奏与唤醒检测、PeerRegistry（身份合并、三态）、错误分类、诊断报告、peers.json 读写保护，以及基于环回的 KcpTransport / NetworkService 集成用例（重启恢复、RST、并发建连、自动重试、单播探测、状态事件）。
+- **集成测试**：`src/test/extension.test.ts`，`npm run test`（@vscode/test-cli + mocha，需要下载并启动 VS Code）。
+- **端到端冒烟**：`npm run compile-tests` 后 `node smoke-test.js`——同一台机器起两个 NetworkService 实例，验证发现、稳定身份、消息、分块文件、进度、离线检测，**不依赖 VS Code**。
