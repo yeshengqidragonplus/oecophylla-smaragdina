@@ -58,7 +58,7 @@ export function activate(context: vscode.ExtensionContext) {
 
     // 自动启动网络服务（读取最新配置，不阻塞激活）
     if (vscode.workspace.getConfiguration('oschat').get<boolean>('autoConnect', true)) {
-        void startNetworkFromConfig(peersManager);
+        void startNetworkFromConfig(peersManager, false);
     }
 
     // 注册启动网络服务的命令：端口、昵称统一来自设置，运行中再次执行即重启

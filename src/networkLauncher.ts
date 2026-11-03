@@ -38,9 +38,11 @@ export function initNetworkIdentity(context: vscode.ExtensionContext): void {
  * 命令面板、侧边栏按钮与自动启动共用这一个入口，保证行为一致，
  * 且不会把临时参数写回用户设置。
  *
- * @returns 是否启动成功（失败原因已通过消息提示给用户）
+ * @param interactive 是否由用户主动触发。自动启动（false）遇到端口被占用时只记日志、由状态栏提示，
+ *   不弹错误：最常见的原因是同一台机器上另一个 VS Code 窗口已经启动了服务，每开一个窗口都弹一次是打扰
+ * @returns 是否启动成功（主动触发时，失败原因已通过消息提示给用户）
  */
-export async function startNetworkFromConfig(_peersManager?: PeersManager): Promise<boolean> {
+export async function startNetworkFromConfig(_peersManager?: PeersManager, interactive: boolean = true): Promise<boolean> {
     const config = vscode.workspace.getConfiguration('oschat');
     const port = config.get<number>('port', 8080);
     const nickname = config.get<string>('nickname', '');
@@ -59,7 +61,9 @@ export async function startNetworkFromConfig(_peersManager?: PeersManager): Prom
     } catch (error) {
         const detail = error instanceof Error ? error.message : String(error);
         logError('启动网络服务失败:', detail);
-        offerOpenPortSetting(`启动网络服务失败: ${detail}`);
+        if (interactive || !detail.includes('EADDRINUSE')) {
+            offerOpenPortSetting(`启动网络服务失败: ${detail}`);
+        }
         return false;
     }
 }
