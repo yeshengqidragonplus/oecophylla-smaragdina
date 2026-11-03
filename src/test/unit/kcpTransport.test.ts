@@ -1,6 +1,6 @@
 import * as assert from 'assert';
 import { KcpError, KcpTransport } from '../../core/kcpTransport';
-import { NetworkMessage, NetworkService } from '../../core/networkService';
+import { BusinessMessage, NetworkService, TextMessage } from '../../core/networkService';
 import { setConsoleEnabled } from '../../core/logger';
 
 const LOCAL = '127.0.0.1';
@@ -248,11 +248,11 @@ suite('NetworkService：会话失效时自动重建并重试', () => {
             await a.start(portA);
             await b.start(portB);
             const idB = `${a.getLocalIp()}:${portB}`;
-            const message = (text: string): NetworkMessage => ({
+            const message = (text: string): TextMessage => ({
                 type: 'message', from: 'x', to: idB, content: text, timestamp: Date.now()
             });
 
-            const first = new Promise<string>(resolve => b.once('message', (m: NetworkMessage) => resolve(m.content ?? '')));
+            const first = new Promise<string>(resolve => b.once('message', (m: BusinessMessage) => resolve(m.type === 'message' ? m.content : '')));
             await a.sendToPeer(idB, message('before restart'));
             assert.strictEqual(await first, 'before restart');
 
@@ -262,7 +262,7 @@ suite('NetworkService：会话失效时自动重建并重试', () => {
             b2 = new NetworkService();
             await b2.start(portB);
 
-            const second = new Promise<string>(resolve => b2!.once('message', (m: NetworkMessage) => resolve(m.content ?? '')));
+            const second = new Promise<string>(resolve => b2!.once('message', (m: BusinessMessage) => resolve(m.type === 'message' ? m.content : '')));
             const started = Date.now();
             await a.sendToPeer(idB, message('after restart'));
             assert.strictEqual(await second, 'after restart');

@@ -1,5 +1,6 @@
 import * as assert from 'assert';
 import * as dgram from 'dgram';
+import { EventEmitter } from 'events';
 import { NetworkService } from '../../core/networkService';
 import { KcpTransport } from '../../core/kcpTransport';
 
@@ -65,7 +66,7 @@ suite('网络层：socket 运行期错误不能抛出', () => {
         const service = new NetworkService();
         await service.start(randomBasePort());
         try {
-            assert.strictEqual(service.listenerCount('error'), 0);
+            assert.strictEqual((service as unknown as EventEmitter).listenerCount('error'), 0);
             assert.doesNotThrow(() => {
                 (service as unknown as { _udpServer: dgram.Socket })._udpServer.emit('error', networkError('ECONNRESET'));
             });

@@ -1,7 +1,6 @@
 import * as crypto from 'crypto';
 import * as dgram from 'dgram';
 import * as os from 'os';
-import * as events from 'events';
 import * as fs from 'fs';
 import { KcpTransport, SessionPeerInfo, isRetryableKcpError } from './kcpTransport';
 import { log, logError } from './logger';
@@ -18,9 +17,22 @@ import {
 } from './netInterfaces';
 import { ProbeState, isClockJump, isProbeDue, nextProbeState } from './probeSchedule';
 import { PeerMeta, PeerRecord, PeerRegistry, Presence } from './peerRegistry';
+import {
+    BusinessMessage,
+    FILE_CHUNK_SIZE,
+    FileChunkMessage,
+    PROTOCOL_VERSION,
+    PresenceMessage,
+    PresenceType,
+    TextMessage,
+    parseBusinessFrame,
+    parsePresenceMessage
+} from './protocol';
+import { TypedEmitter } from './typedEmitter';
 
-/** 线上协议版本：2 = 带实例 ID / boot 标识 / meta */
-export const PROTOCOL_VERSION = 2;
+// 协议类型集中定义在 protocol.ts，这里重新导出，保持原有的 import 路径可用
+export type { BusinessMessage, FileChunkMessage, NetworkMessage, PresenceMessage, TextMessage } from './protocol';
+export { PROTOCOL_VERSION } from './protocol';
 
 export interface PeerInfo {
     id: string;
@@ -37,35 +49,6 @@ export interface PeerInfo {
     iid?: string;
     meta?: PeerMeta;
     manual?: boolean;
-}
-
-export interface NetworkMessage {
-    /** 业务消息 ID：接收端据此去重（会话重建后重发不会重复显示） */
-    id?: string;
-    type: 'message' | 'file'
-        | 'discovery_request' | 'discovery_response'
-        | 'heartbeat' | 'heartbeat_ack';
-    from: string;
-    fromHostname?: string;
-    fromNickname?: string;
-    to?: string;
-    content?: string;
-    timestamp: number;
-    file?: {
-        name: string;
-        size: number;
-        data?: string;
-        chunkIndex?: number;
-        totalChunks?: number;
-    };
-    transferPort?: number;
-    /** 协议版本（旧版没有） */
-    proto?: number;
-    /** 发送方实例 ID */
-    iid?: string;
-    /** 发送方本次启动标识：变化说明它重启过 */
-    boot?: string;
-    meta?: PeerMeta;
 }
 
 /** 网络服务的运行状态，供界面显示与诊断 */
@@ -87,6 +70,23 @@ export interface StartOptions {
     machineId?: string;
     /** 随握手与发现携带的版本信息（os/arch/node 由内部填充） */
     meta?: Partial<PeerMeta>;
+}
+
+/** 网络错误事件：分类后的 socket 错误，附带出错的位置与目标 */
+export type NetworkErrorEvent = NetErrorInfo & { scope: string; target?: string; at: number };
+
+/** NetworkService 的事件表：事件名与监听器参数在编译期检查 */
+export interface NetworkServiceEvents {
+    peersUpdate: [PeerInfo[]];
+    /** 收到一条通过校验的业务消息（文本 / 文件分块），`from` 为会话键（联系人 id） */
+    message: [BusinessMessage];
+    statusChange: [NetworkStatus];
+    transferTaskCreated: [TransferTask];
+    transferTaskUpdated: [TransferTask];
+    transferTaskCompleted: [TransferTask];
+    transferTaskFailed: [TransferTask];
+    networkError: [NetworkErrorEvent];
+    networkResume: [string];
 }
 
 export interface TransferTask {
@@ -117,8 +117,6 @@ const DISCOVERY_QUICK_DELAYS = [1_000, 3_000];
  * 应答通过单播回到请求方的主端口。
  */
 const DISCOVERY_PORT = 41320;
-/** 文件分块大小（原始字节，发送时转 base64） */
-const FILE_CHUNK_SIZE = 64 * 1024;
 /** KCP 握手建连超时（毫秒） */
 const CONNECT_TIMEOUT = 5_000;
 /** 手动扫描网段：单个网段最多探测的主机数（/22 为 1022；更大的网段不扫） */
@@ -127,7 +125,7 @@ const SCAN_HOST_LIMIT = 1022;
 const SCAN_BATCH_SIZE = 64;
 const SCAN_BATCH_DELAY = 20;
 
-export class NetworkService extends events.EventEmitter {
+export class NetworkService extends TypedEmitter<NetworkServiceEvents> {
     private _udpServer: dgram.Socket | null = null;
     /** 共享发现端口的监听 socket（仅接收 discovery_request） */
     private _discoverySocket: dgram.Socket | null = null;
@@ -169,7 +167,7 @@ export class NetworkService extends events.EventEmitter {
     /** 网络错误日志限流（断网时每个 UDP 包都会失败，不能每条都写日志） */
     private _errorThrottle = new ErrorThrottle();
     private _netErrorCounts: Map<string, number> = new Map();
-    private _lastNetError: (NetErrorInfo & { scope: string; target?: string; at: number }) | null = null;
+    private _lastNetError: NetworkErrorEvent | null = null;
 
     constructor() {
         super();
@@ -304,13 +302,16 @@ export class NetworkService extends events.EventEmitter {
                 this._reportNetError('discovery', err);
             });
             socket.on('message', (msg, rinfo) => {
-                try {
-                    const data = JSON.parse(msg.toString());
-                    if (data.type === 'discovery_request' && !this._isSelfMessage(data, rinfo.address, rinfo.port)) {
-                        // rinfo.port 是请求方的主端口（从主 socket 发出）
-                        this._handleDiscoveryRequest(data, rinfo.address, rinfo.port);
-                    }
-                } catch (_) { /* ignore */ }
+                const parsed = parsePresenceMessage(msg);
+                if (!parsed.ok) {
+                    this._logBadDatagram('discovery', rinfo.address, parsed.reason);
+                    return;
+                }
+                const data = parsed.msg;
+                if (data.type === 'discovery_request' && !this._isSelfMessage(data, rinfo.address, rinfo.port)) {
+                    // rinfo.port 是请求方的主端口（从主 socket 发出）
+                    this._handleDiscoveryRequest(data, rinfo.address, rinfo.port);
+                }
             });
             socket.bind(DISCOVERY_PORT, () => {
                 log(`Discovery socket listening on shared port ${DISCOVERY_PORT}`);
@@ -343,7 +344,7 @@ export class NetworkService extends events.EventEmitter {
     }
 
     /** 本机发出的所有 UDP 消息共用的头部：旧字段保持不变（兼容旧版），新增协议版本、实例 ID、boot 与 meta */
-    private _baseMessage(type: NetworkMessage['type'], to?: string): NetworkMessage {
+    private _baseMessage(type: PresenceType, to?: string): PresenceMessage {
         return {
             type,
             from: this.getLocalIp(),
@@ -362,7 +363,7 @@ export class NetworkService extends events.EventEmitter {
     /**
      * 处理发现请求 - 回复自己的信息
      */
-    private _handleDiscoveryRequest(msg: NetworkMessage, ip: string, port: number): void {
+    private _handleDiscoveryRequest(msg: PresenceMessage, ip: string, port: number): void {
         this._sendTo(ip, port, this._baseMessage('discovery_response', `${ip}:${port}`));
         this._observeFromUdp(msg, ip, port, 'inbound', 'Discovery');
     }
@@ -370,7 +371,7 @@ export class NetworkService extends events.EventEmitter {
     /**
      * 处理发现响应：往返确认
      */
-    private _handleDiscoveryResponse(msg: NetworkMessage, ip: string, port: number): void {
+    private _handleDiscoveryResponse(msg: PresenceMessage, ip: string, port: number): void {
         this._observeFromUdp(msg, ip, port, 'ack', 'Discovery');
     }
 
@@ -378,7 +379,7 @@ export class NetworkService extends events.EventEmitter {
      * 把收到的 UDP 消息登记到注册表。
      * 地址取自 rinfo（观察值）而不是对端自称的 from；身份优先用对端的实例 ID。
      */
-    private _observeFromUdp(msg: NetworkMessage, ip: string, port: number, kind: 'inbound' | 'ack', logTag: string): void {
+    private _observeFromUdp(msg: PresenceMessage, ip: string, port: number, kind: 'inbound' | 'ack', logTag: string): void {
         const known = !!this.registry.findByAddress(ip, port) || (!!msg.iid && !!this.registry.resolve(msg.iid));
         const rec = this.registry.observe({
             kind,
@@ -464,7 +465,7 @@ export class NetworkService extends events.EventEmitter {
     /**
      * 处理收到的心跳，并回复确认
      */
-    private _handleHeartbeat(msg: NetworkMessage, ip: string, port: number): void {
+    private _handleHeartbeat(msg: PresenceMessage, ip: string, port: number): void {
         this._observeFromUdp(msg, ip, port, 'inbound', 'Heartbeat');
         this._sendTo(ip, port, this._baseMessage('heartbeat_ack', `${ip}:${port}`));
     }
@@ -472,7 +473,7 @@ export class NetworkService extends events.EventEmitter {
     /**
      * 处理心跳确认：往返确认
      */
-    private _handleHeartbeatAck(msg: NetworkMessage, ip: string, port: number): void {
+    private _handleHeartbeatAck(msg: PresenceMessage, ip: string, port: number): void {
         this._observeFromUdp(msg, ip, port, 'ack', 'Heartbeat');
     }
 
@@ -493,17 +494,18 @@ export class NetworkService extends events.EventEmitter {
         }
 
         this._transport.on('data', (peerId: string, data: Buffer) => {
-            try {
-                const msg = JSON.parse(data.toString()) as NetworkMessage;
-                msg.from = peerId;
-                if (msg.id && this._isDuplicateMessage(msg.id)) {
-                    log(`[消息] 忽略重复消息 ${msg.id}（会话重建后的重发）`);
-                    return;
-                }
-                this.emit('message', msg);
-            } catch (err) {
-                logError('Failed to parse KCP message:', err);
+            const parsed = parseBusinessFrame(data);
+            if (!parsed.ok) {
+                this._logBadDatagram('kcp', peerId, parsed.reason);
+                return;
             }
+            const msg = parsed.msg;
+            msg.from = peerId;
+            if (msg.type === 'message' && msg.id && this._isDuplicateMessage(msg.id)) {
+                log(`[消息] 忽略重复消息 ${msg.id}（会话重建后的重发）`);
+                return;
+            }
+            this.emit('message', msg);
         });
 
         this._transport.on('sessionConnected', (peerId: string, info?: SessionPeerInfo) => {
@@ -630,33 +632,39 @@ export class NetworkService extends events.EventEmitter {
      * UDP 通道仅处理发现/心跳消息
      */
     private _handleMessage(msg: Buffer, rinfo: dgram.RemoteInfo): void {
-        try {
-            const data = JSON.parse(msg.toString());
-            const peerIp = rinfo.address;
-            const peerPort = rinfo.port;
+        const parsed = parsePresenceMessage(msg);
+        if (!parsed.ok) {
+            this._logBadDatagram('udp', rinfo.address, parsed.reason);
+            return;
+        }
+        const data = parsed.msg;
+        const peerIp = rinfo.address;
+        const peerPort = rinfo.port;
 
-            if (this._isSelfMessage(data, peerIp, peerPort)) {
-                return;
-            }
+        if (this._isSelfMessage(data, peerIp, peerPort)) {
+            return;
+        }
 
-            switch (data.type) {
-                case 'discovery_request':
-                    this._handleDiscoveryRequest(data, peerIp, peerPort);
-                    break;
-                case 'discovery_response':
-                    this._handleDiscoveryResponse(data, peerIp, peerPort);
-                    break;
-                case 'heartbeat':
-                    this._handleHeartbeat(data, peerIp, peerPort);
-                    break;
-                case 'heartbeat_ack':
-                    this._handleHeartbeatAck(data, peerIp, peerPort);
-                    break;
-                default:
-                    break;
-            }
-        } catch (err) {
-            logError('Failed to parse UDP message:', err);
+        switch (data.type) {
+            case 'discovery_request':
+                this._handleDiscoveryRequest(data, peerIp, peerPort);
+                break;
+            case 'discovery_response':
+                this._handleDiscoveryResponse(data, peerIp, peerPort);
+                break;
+            case 'heartbeat':
+                this._handleHeartbeat(data, peerIp, peerPort);
+                break;
+            case 'heartbeat_ack':
+                this._handleHeartbeatAck(data, peerIp, peerPort);
+                break;
+        }
+    }
+
+    /** 收到无法识别或校验不通过的数据：丢弃，并按来源限流记录一条日志（局域网上的杂包不能刷屏） */
+    private _logBadDatagram(channel: string, source: string, reason: string): void {
+        if (this._errorThrottle.check(`bad:${channel}:${source}`) !== null) {
+            logError(`[${channel}] 丢弃来自 ${source} 的无效数据：${reason}`);
         }
     }
 
@@ -705,7 +713,7 @@ export class NetworkService extends events.EventEmitter {
      * 会话失效类错误（对端重启/睡眠后残留的僵尸会话、确认超时）时，销毁旧会话、重新握手并重发一次——
      * 用户不必手动点第二次。重发的是完整帧：文本消息带 id、接收端去重；文件分块按块号去重。
      */
-    private async _sendViaTransport(peerId: string, message: NetworkMessage): Promise<void> {
+    private async _sendViaTransport(peerId: string, message: BusinessMessage): Promise<void> {
         const peer = this._resolvePeer(peerId);
         const data = Buffer.from(JSON.stringify(message));
         for (let attempt = 0; ; attempt++) {
@@ -783,7 +791,7 @@ export class NetworkService extends events.EventEmitter {
 
         try {
             for (const message of task.messages) {
-                const msg: NetworkMessage = {
+                const msg: TextMessage = {
                     id: crypto.randomUUID(),
                     type: 'message',
                     from: this._localPeerId(),
@@ -830,7 +838,7 @@ export class NetworkService extends events.EventEmitter {
             for (let chunkIndex = 0; chunkIndex < totalChunks; chunkIndex++) {
                 const { bytesRead } = await handle.read(chunkBuffer, 0, FILE_CHUNK_SIZE, chunkIndex * FILE_CHUNK_SIZE);
 
-                const msg: NetworkMessage = {
+                const msg: FileChunkMessage = {
                     type: 'file',
                     from: this._localPeerId(),
                     to: task.peerId,
@@ -863,7 +871,7 @@ export class NetworkService extends events.EventEmitter {
     /**
      * 通过 UDP 发送（仅用于发现/心跳消息）
      */
-    private _sendTo(ip: string, port: number, message: NetworkMessage): void {
+    private _sendTo(ip: string, port: number, message: PresenceMessage): void {
         this._udpSend(Buffer.from(JSON.stringify(message)), port, ip, 'udp');
     }
 
@@ -903,7 +911,7 @@ export class NetworkService extends events.EventEmitter {
     }
 
     /** 最近一次网络错误（供诊断与状态展示） */
-    public getLastNetError(): (NetErrorInfo & { scope: string; target?: string; at: number }) | null {
+    public getLastNetError(): NetworkErrorEvent | null {
         return this._lastNetError;
     }
 
@@ -915,7 +923,7 @@ export class NetworkService extends events.EventEmitter {
     /**
      * 发送消息到指定 peer（通过 KCP 可靠传输）
      */
-    public async sendToPeer(peerId: string, message: NetworkMessage): Promise<void> {
+    public async sendToPeer(peerId: string, message: BusinessMessage): Promise<void> {
         await this._sendViaTransport(peerId, message);
     }
 

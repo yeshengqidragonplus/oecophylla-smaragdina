@@ -4,7 +4,7 @@ import * as path from 'path';
 import * as vscode from 'vscode';
 import { PeersManager } from '../peersManager';
 import { PeerRegistry } from '../core/peerRegistry';
-import { NetworkService, PeerInfo, NetworkMessage, TransferTask } from '../core/networkService';
+import { NetworkService, PeerInfo, BusinessMessage, FileChunkMessage, PresenceMessage, TextMessage, TransferTask } from '../core/networkService';
 
 suite('Extension Test Suite', () => {
     vscode.window.showInformationMessage('Start all tests.');
@@ -197,16 +197,16 @@ suite('Extension Test Suite', () => {
         });
 
         test('should handle message event', (done) => {
-            const testMsg: NetworkMessage = {
+            const testMsg: TextMessage = {
                 type: 'message',
                 from: '192.168.1.101:8080',
                 content: '你好',
                 timestamp: Date.now()
             };
 
-            networkService.on('message', (msg: NetworkMessage) => {
-                assert.strictEqual(msg.content, '你好');
+            networkService.on('message', (msg: BusinessMessage) => {
                 assert.strictEqual(msg.type, 'message');
+                assert.strictEqual(msg.type === 'message' && msg.content, '你好');
                 done();
             });
 
@@ -216,7 +216,7 @@ suite('Extension Test Suite', () => {
 
     suite('NetworkMessage Structure', () => {
         test('should create valid chat message', () => {
-            const msg: NetworkMessage = {
+            const msg: TextMessage = {
                 type: 'message',
                 from: '192.168.1.100',
                 to: '192.168.1.101:8080',
@@ -227,7 +227,7 @@ suite('Extension Test Suite', () => {
         });
 
         test('should create valid file message', () => {
-            const msg: NetworkMessage = {
+            const msg: FileChunkMessage = {
                 type: 'file',
                 from: '192.168.1.100',
                 to: '192.168.1.101:8080',
@@ -235,15 +235,17 @@ suite('Extension Test Suite', () => {
                 file: {
                     name: 'test.txt',
                     size: 1024,
+                    chunkIndex: 0,
+                    totalChunks: 1,
                     data: 'base64data'
                 }
             };
-            assert.strictEqual(msg.file?.name, 'test.txt');
-            assert.strictEqual(msg.file?.size, 1024);
+            assert.strictEqual(msg.file.name, 'test.txt');
+            assert.strictEqual(msg.file.size, 1024);
         });
 
         test('should create valid discovery request message', () => {
-            const msg: NetworkMessage = {
+            const msg: PresenceMessage = {
                 type: 'discovery_request',
                 from: '192.168.1.100',
                 fromHostname: 'PC-Test',
@@ -258,7 +260,7 @@ suite('Extension Test Suite', () => {
         });
 
         test('should create valid discovery response message', () => {
-            const msg: NetworkMessage = {
+            const msg: PresenceMessage = {
                 type: 'discovery_response',
                 from: '192.168.1.101',
                 fromHostname: 'PC-Remote',
@@ -271,7 +273,7 @@ suite('Extension Test Suite', () => {
         });
 
         test('should create valid heartbeat message', () => {
-            const msg: NetworkMessage = {
+            const msg: PresenceMessage = {
                 type: 'heartbeat',
                 from: '192.168.1.100',
                 fromHostname: 'PC-Test',
@@ -284,7 +286,7 @@ suite('Extension Test Suite', () => {
         });
 
         test('should create valid heartbeat_ack message', () => {
-            const msg: NetworkMessage = {
+            const msg: PresenceMessage = {
                 type: 'heartbeat_ack',
                 from: '192.168.1.101',
                 fromHostname: 'PC-Remote',

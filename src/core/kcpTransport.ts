@@ -1,8 +1,8 @@
 import * as crypto from 'crypto';
 import * as dgram from 'dgram';
-import * as events from 'events';
 import { Kcp } from './kcp';
 import { log, logError } from './logger';
+import { TypedEmitter } from './typedEmitter';
 
 /**
  * KCP 传输层 - 承载所有业务消息（聊天、文件）
@@ -121,7 +121,17 @@ interface KcpSession {
     lastKeepaliveAt: number;
 }
 
-export class KcpTransport extends events.EventEmitter {
+/** KcpTransport 的事件表（_established 为内部事件，用于握手完成的等待与仲裁） */
+export interface KcpTransportEvents {
+    data: [peerId: string, frame: Buffer];
+    sessionConnected: [peerId: string, info: SessionPeerInfo];
+    sessionClosed: [peerId: string];
+    sessionError: [peerId: string, err: Error];
+    transportError: [err: Error, target?: string];
+    _established: [peerId: string];
+}
+
+export class KcpTransport extends TypedEmitter<KcpTransportEvents> {
     private _socket: dgram.Socket | null = null;
     private _port: number;
     /** 本端旧版 peerId（`ip:主端口`），仅为兼容旧版对端 */

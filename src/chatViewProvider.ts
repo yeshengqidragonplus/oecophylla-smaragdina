@@ -4,7 +4,7 @@ import * as path from 'path';
 import { PeersManager } from './peersManager';
 import { log, logError } from './core/logger';
 import { getBuildHash } from './core/buildInfo';
-import { networkService, NetworkMessage, NetworkStatus, TransferTask } from './core/networkService';
+import { networkService, BusinessMessage, FileChunkMessage, NetworkStatus, TransferTask } from './core/networkService';
 import { startNetworkFromConfig, stopNetwork } from './networkLauncher';
 
 interface ChatMessage {
@@ -71,7 +71,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         this._loadSessions();
 
         // 监听网络消息
-        networkService.on('message', (msg: NetworkMessage) => {
+        networkService.on('message', (msg: BusinessMessage) => {
             this._handleIncomingMessage(msg);
         });
 
@@ -313,7 +313,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         this._updateWebviewContent();
     }
 
-    private _handleIncomingMessage(msg: NetworkMessage): void {
+    private _handleIncomingMessage(msg: BusinessMessage): void {
         const peer = this._peersManager.getPeerById(msg.from);
         const displayName = peer ? this._peersManager.getPeerDisplayName(peer) : msg.from;
 
@@ -428,11 +428,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         this._updateWebviewContent();
     }
 
-    private _handleFileChunk(msg: NetworkMessage, displayName: string): void {
-        if (!msg.file || msg.file.chunkIndex === undefined || msg.file.totalChunks === undefined || !msg.file.data) {
-            return;
-        }
-
+    private _handleFileChunk(msg: FileChunkMessage, displayName: string): void {
         const transferKey = `${msg.from}:${msg.file.name}`;
         let transfer = this._incomingFileTransfers.get(transferKey);
 
