@@ -71,6 +71,11 @@
 | `core/probeSchedule.ts` | 对端探测节奏与睡眠唤醒判定（纯函数） |
 | `core/netErrors.ts` | socket 错误分类（按系统给出建议）与日志限流 |
 | `core/diagnostics.ts` | 诊断报告与初步判断规则 |
+| `core/protocol.ts` | 线上协议：消息类型（判别联合）、协议版本、**输入校验**（类型、长度、范围，totalChunks 必须与文件大小一致……），校验不通过的数据直接丢弃 |
+| `core/typedEmitter.ts` | 类型安全的 EventEmitter（NetworkService、KcpTransport 的事件表在编译期检查） |
+| `core/fileReceiver.ts` / `core/fileReceiveService.ts` | 流式文件接收（`.part` 临时文件按偏移写盘）与接收侧粘合层（交给接收器、回 `file_ack`） |
+| `core/safeFileName.ts` / `core/downloadDir.ts` | 接收文件名清理（Mac / Windows / Linux 通用）与保存目录解析（下载文件夹、可写校验、回退） |
+| `core/chatStore.ts` / `core/messaging.ts` | 聊天记录（一人一会话、异步原子增量存储、旧数据迁移）与消息服务（发送、取消、重试、接收入库） |
 | `core/kcp.ts` | KCP 协议核心（ikcp.c 纯 TS 移植，ARQ，无 FEC，零依赖） |
 | `core/kcpTransport.ts` | KCP 业务通道：专用 UDP socket、SYN/ACK/FIN/RST 控制报文、会话仲裁、conv 路由、帧编解码、会话表 |
 | `core/peerFileStore.ts` | `peers.json` 读写：读不出可信内容时不写盘，原子写盘 |
@@ -78,7 +83,11 @@
 | `src/extension.ts` | 插件入口：注册命令、装配各模块、按 `oschat.autoConnect` 自动启动 |
 | `src/networkLauncher.ts` | 启动/停止网络服务的统一入口（命令面板、侧边栏、自动启动共用），负责本机标识与版本信息 |
 | `src/peersManager.ts` | 联系人持久化与视图：把 `PeerRegistry` 投影成界面用的联系人列表，防抖写 `peers.json` |
-| `src/chatViewProvider.ts` | 侧边栏 Webview（视图 ID `OSChatView`）：会话/消息管理、文件接收重组与进度、未读提醒、HTML 界面内联生成 |
+| `src/chatViewProvider.ts` | 侧边栏 Webview（视图 ID `OSChatView`）：只做 webview 桥接、当前会话与文件选择、未读提醒；业务状态全部在 ChatStore / MessagingService / PeerRegistry |
+| `src/legacyChatHtml.ts` / `src/legacyChatAdapter.ts` | 旧界面的 HTML/CSS/脚本与会话投影（M3 用新界面整体替换后删除） |
+| `src/receiveDir.ts` | 接收目录解析（读设置、回退时提示一次原因） |
+| `src/shared/` | 扩展 ↔ 新界面的类型化消息协议与界面状态归约（纯函数，有单测） |
+| `src/webview/` + `src/webviewHtml.ts` / `src/webviewHost.ts` | 新界面前端（TypeScript + Preact + 外置 CSS，独立打包到 `dist/webview`）与加载它的 HTML 外壳（脚本带 nonce、无内联脚本）。**管线已就绪，M3 接入侧边栏** |
 | `src/statusBar.ts` / `src/diagnose.ts` | 状态栏与标题栏启停切换；诊断与扫描网段命令 |
 | `src/peersEditor.ts` / `src/settingsPanel.ts` | 联系人编辑、设置的独立 Webview 面板（计划用原生设置替代） |
 
@@ -92,7 +101,11 @@
 | `discovery_response` | UDP 单播 → 请求方主端口 | 发现应答（往返确认） |
 | `heartbeat` / `heartbeat_ack` | UDP 单播 | 心跳与确认，维护在线状态 |
 | `message` | KCP | 聊天文本（`content` 字段，`id` 用于去重） |
-| `file` | KCP | 文件分块（`file.{name,size,chunkIndex,totalChunks,data(base64)}`） |
+| `file` | KCP | 文件分块（`file.{name,size,chunkIndex,totalChunks,data(base64),chunkSize,transferId}`） |
+| `file_end` | KCP | 发送方声明"该文件已全部发出"（`transferId,name,size,totalChunks`） |
+| `file_ack` | KCP | 接收方对落盘结果的确认（`transferId,ok,reason`） |
+
+所有入站消息（UDP 与 KCP）先经 `core/protocol.ts` 校验再处理：类型、长度、范围不合法的直接丢弃并按来源限流记一条日志；下游拿到的一定结构合法、大小受限（`totalChunks` 必须等于 `ceil(size / chunkSize)`，`chunkIndex` 不得越界，`size` 不超过 4GB，文本不超过 100 万字符）。
 
 **协议 v2 的新增字段**（旧字段不变，旧版对端忽略未知字段，两端不必同时升级）：
 
@@ -103,6 +116,8 @@
 | `boot` | 发送方本次启动的随机标识；变化说明对端重启过，旧的 KCP 会话立即作废 |
 | `meta` | 系统、架构、Node、插件版本、构建指纹、VS Code 版本，用于联系人详情与排查 |
 | `id`（业务消息） | 消息 ID，接收端保留最近 512 个做去重（会话重建后的重发不会重复显示） |
+
+**协议 v3**（文件传输）：每个文件带 `transferId` 与 `chunkSize`；发送方在全部分块被传输层确认后发 `file_end`，接收方落盘成功（或失败）后回 `file_ack`，发送方据此判定成败。旧版对端（协议 < 3）没有这两个消息，发送方按对端的 `proto` 判断，保持原行为，**两端不必同时升级**。
 
 地址取自接收到的 UDP 包的来源地址（`rinfo`），**不取对端自称的 `from`**。
 
@@ -149,16 +164,20 @@
 
 ### 发送侧（networkService）
 
-1. UI 发起 → `createTransferTask()` 创建 TransferTask（状态机：`pending → connecting → transferring → completed / failed / timeout`）。
-2. `executeTransferTask()`：先确保 KCP 会话，然后顺序发送文本消息，再逐个文件分块发送。
-3. 分块：**64 KB** 原始字节/块，`fs.promises.open` + 按偏移读取——**流式读盘，整个文件不驻留内存**；每块转 base64 放入 `file` 消息。进度按真实已发字节计算，变化时才发 `transferTaskUpdated` 事件。
-4. 选文件时只记录元信息（名称/路径/大小），发送时才读取内容。
+1. UI 发起 → `MessagingService.send()`：文本与**每个文件各自独立**成一条消息、各创建一个 TransferTask（状态机：`pending → connecting → transferring → completed / failed / timeout / cancelled`），各有各的状态，一个失败不影响其他，失败的可重试、进行中的可取消。
+2. `executeTransferTask()`：先确保 KCP 会话，再发送。
+3. 分块：**64 KB** 原始字节/块，`fs.promises.open` + 按偏移读取——**流式读盘，整个文件不驻留内存**；每块转 base64 放入 `file` 消息。**滑动窗口并发发送（8 块在途）**，不再逐块等 ACK（原先吞吐约等于 64KB/RTT）；进度按真实已确认字节计算。
+4. 协议 v3 对端：全部分块被传输层确认后发 `file_end`，等待接收端的 `file_ack`（最长 30 秒）——传输层确认只说明对端收到了，`file_ack` 才说明对端**存下来了**。接收端写盘失败、从未收到数据（如重启过）时发送方立即失败并拿到原因。
+5. 待发送文件被占用（Windows 下已打开的 Excel 等）或被删除时给出可读提示；已结束超过 10 分钟的任务自动清理。
 
-### 接收侧（chatViewProvider）
+### 接收侧（core/fileReceiver）
 
-1. 按 `from + 文件名` 维护 `IncomingFileTransfer`，收集分块并更新进度 UI。
-2. 收齐后重组写盘，保存目录取 `oschat.downloadPath`（默认下载目录）。
-3. **文件名安全**（防路径穿越，硬性约定）：`path.basename` + 过滤 `[\\/:*?"<>|]`；同名文件自动加序号，不覆盖已有文件。
+1. 以 `对端 + transferId` 区分传输（旧版发送方退化为 对端+文件名+大小+块数）：同名文件并发、失败后重发互不混淆。
+2. 每块校验长度后按偏移直接写入 `.part` 临时文件，**内存里只有当前块**；分块可乱序、可重复；0 字节文件正常落盘。
+3. 收齐后校验总长，用硬链接放到最终位置（目标已存在时原子失败并换序号；FAT/exFAT 等不支持硬链接的外接盘退回 rename），同名加序号不覆盖。
+4. 失败（磁盘已满、没有权限、块长度不符）或 2 分钟没有数据时清理 `.part` 并发出 `failed`；启动时清理上次崩溃遗留的临时文件；同时进行的接收上限 16 个。
+5. **保存目录**：`oschat.downloadPath` → 系统"下载"文件夹下的 `OS Chat` → 扩展全局存储下的 `downloads` → 临时目录；目录不可用（如外接卷未挂载）时回退并提示一次，而不是让接收失败。
+6. **文件名安全**（硬性约定，`core/safeFileName.ts`）：同时按 `/` 和 `\` 取最后一段（防路径穿越，与接收端系统无关）、NFD 归一化为 NFC、删除控制字符并替换 `< > : " | ? *`、去掉末尾的点和空格、Windows 保留设备名（`CON`、`con.txt`、`COM1.log`……）加前缀、按 UTF-8 字节截断（保留扩展名、不切断多字节字符）、Windows 完整路径过长时缩短主名。
 
 ## 5. 会话与持久化
 
@@ -169,7 +188,11 @@
   - 自动发现的对端 30 天未见则清理，手工添加或编辑过的永不自动清理；
   - **读不出可信内容时绝不写盘**：路径不可用（外接卷未挂载）期间不写，路径恢复后与文件内容合并再写；文件损坏时先备份为 `.corrupt-时间戳`，修复前不写；
   - 写盘为"临时文件 + 重命名"的原子写，2 秒防抖；没有实质变化（只有在线状态、lastSeen 在变）时不写盘，`lastSeen` 在实质变化与插件停用时落盘。
-- **聊天会话**持久化在全局存储目录的 `chatSessions.json`（整份重写，后续里程碑改为增量存储）。
+- **聊天记录**（`core/chatStore.ts`，全局存储目录下的 `chats/`）：
+  - **一个联系人对应一个会话**，按联系人的规范 id 归并，旧版 `ip:端口` 与换 IP 前的地址等别名自动对应到同一个会话；
+  - 消息模型：`direction`（in / out / system）+ `status`（sending / delivered / failed）+ 可选文件信息（进度、状态、保存路径）；
+  - 每个会话一个文件，只写有变化的会话，1 秒防抖、异步、原子写；文件进度这类高频瞬时状态只更新内存，不触发写盘；每个会话最多 2000 条；损坏的文件挪到一边保留；
+  - 首次启动自动迁移旧的 `chatSessions.json`：同一联系人的多个旧会话合并、消息按时间排序并按 id 去重，原文件改名为 `.migrated-时间戳` 保留作为备份。
 
 ## 6. 配置项（`oschat.*`）
 
@@ -181,7 +204,7 @@
 | `nickname` | — | 昵称，随发现/心跳广播；留空则使用计算机名。修改后需重启网络服务 |
 | `autoConnect` | true | VS Code 启动后自动启动网络服务（配合 `onStartupFinished` 激活） |
 | `peersFilePath` | — | peers.json 所在目录（空则用插件存储目录） |
-| `downloadPath` | — | 接收文件保存目录 |
+| `downloadPath` | — | 接收文件保存目录；留空则为系统"下载"文件夹下的 `OS Chat`，目录不可用时自动回退 |
 
 命令（category 均为 "OS Chat"）：`myChat.startNetwork`（读取最新设置，运行中再次执行即重启）、`myChat.stopNetwork`、`myChat.newChat`、`myChat.editPeers`、`myChat.openPeersFile`、`myChat.openSettings`、`myChat.showLogs`、`myChat.diagnose`（诊断报告）、`myChat.scanSubnet`（手动扫描网段）。
 
@@ -201,13 +224,12 @@
 - **无加密无认证**：协议明文 JSON，身份帧可伪造。设计前提是受信任的小型内网；不要在不可信网络使用。
 - 接收文件名已做路径穿越防护（§4），这是唯一的输入硬化点之一；业务帧长度上限防止恶意超大帧。
 - 文件分块经 base64 编码（约 +33% 体积），换取协议统一为 JSON 帧的简单性；内网带宽下可接受。
-- 接收侧分块在内存中累积到收齐才写盘，超大文件会占用相应内存（与发送侧的流式读取不对称，已知权衡）。
-- 接收侧每收一块会同步重写整份 `chatSessions.json`，大文件传输时会阻塞扩展宿主（后续里程碑改为流式落盘与增量存储）。
-- 一帧最多 128 个 KCP 分片（约 150KB），超长的单条文本消息会发送失败；文件按 64KB 分块不受影响。
+- 一帧最多 128 个 KCP 分片（约 150KB，已有测试固化），超长的单条文本消息会发送失败；文件按 64KB 分块（帧约 88KB）不受影响。
 - 仅支持 IPv4；同机第二个 VS Code 窗口会因 KCP 端口被占用而启动失败（守护进程方案见 DAEMON-DESIGN.md，尚未实现）。
 
 ## 9. 测试
 
-- **单元测试**（不启动 VS Code，反馈快）：`npm run test:unit`，位于 `src/test/unit/`，覆盖网卡与广播计算（含 Mac / 中文 Windows / Linux 夹具）、探测节奏与唤醒检测、PeerRegistry（身份合并、三态）、错误分类、诊断报告、peers.json 读写保护，以及基于环回的 KcpTransport / NetworkService 集成用例（重启恢复、RST、并发建连、自动重试、单播探测、状态事件）。
+- **单元测试**（不启动 VS Code，反馈快）：`npm run test:unit`，位于 `src/test/unit/`，覆盖网卡与广播计算（含 Mac / 中文 Windows / Linux 夹具）、探测节奏与唤醒检测、PeerRegistry、协议校验、错误分类、诊断报告、peers.json 读写保护、文件名清理与下载目录、FileReceiver、ChatStore 与旧数据迁移、界面状态归约，**KCP 协议层的丢包/乱序/重复/延迟测试**，以及基于环回的 KcpTransport / NetworkService / MessagingService 集成用例（重启恢复、RST、并发建连、自动重试、单播探测、状态事件、流水线文件传输与落盘确认、取消、重试）。依赖本机有局域网网卡的用例在没有网卡的环境里自动跳过。
+- **持续集成**：`.github/workflows/ci.yml` 在 macOS / Windows / Ubuntu 三平台跑类型检查、lint、单元测试与打包。
 - **集成测试**：`src/test/extension.test.ts`，`npm run test`（@vscode/test-cli + mocha，需要下载并启动 VS Code）。
 - **端到端冒烟**：`npm run compile-tests` 后 `node smoke-test.js`——同一台机器起两个 NetworkService 实例，验证发现、稳定身份、消息、分块文件、进度、离线检测，**不依赖 VS Code**。
