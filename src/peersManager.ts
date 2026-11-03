@@ -1,6 +1,6 @@
 import * as vscode from 'vscode';
-import * as fs from 'fs';
 import * as path from 'path';
+import { PeerFileStore, mergePeers } from './peerFileStore';
 
 export interface StoredPeerInfo {
     id: string;
@@ -16,12 +16,19 @@ export class PeersManager {
     private _peersFilePath: string = '';
     private _peers: Map<string, StoredPeerInfo> = new Map();
     private _context: vscode.ExtensionContext;
+    private _store: PeerFileStore<StoredPeerInfo>;
+    /** 是否已成功从文件读取过（路径不可用时为 false，期间不写盘，路径恢复后合并再写） */
+    private _loaded: boolean = false;
+    /** 文件损坏时的保护原因：非空表示拒绝写盘，直到用户修复后重新加载 */
+    private _protectedReason: string | undefined;
+    private _warned: Set<string> = new Set();
     /** 写盘防抖定时器：心跳等高频更新合并为一次写入 */
     private _saveTimer: NodeJS.Timeout | null = null;
 
     constructor(context: vscode.ExtensionContext) {
         this._context = context;
         this._updatePeersFilePath();
+        this._store = new PeerFileStore<StoredPeerInfo>(this._peersFilePath);
         this._loadPeers();
     }
 
@@ -38,60 +45,71 @@ export class PeersManager {
     }
 
     private _loadPeers(): void {
-        try {
-            if (fs.existsSync(this._peersFilePath)) {
-                const data = fs.readFileSync(this._peersFilePath, 'utf-8');
-                const peersArray = JSON.parse(data) as StoredPeerInfo[];
-                
-                // 为每个 peer 确保有 id 字段
-                const processedPeers = peersArray.map(p => {
-                    // 如果没有 id 字段，根据 ip:port 生成
-                    if (!p.id) {
-                        p.id = `${p.ip}:${p.port}`;
-                    }
-                    return p;
-                });
-                
-                this._peers = new Map(processedPeers.map(p => [p.id, p]));
-                console.log(`Loaded ${peersArray.length} peers from ${this._peersFilePath}`);
-                
-                // 如果有 peer 缺少 id，保存更新后的数据
-                if (peersArray.some(p => !p.id)) {
-                    this._savePeers();
-                }
-            } else {
-                // 创建默认的 peers.json 文件
-                this._createDefaultPeersFile();
-            }
-        } catch (err) {
-            console.error('Failed to load peers:', err);
-            this._peers = new Map();
+        this._store.setPath(this._peersFilePath);
+        this._protectedReason = undefined;
+
+        const result = this._store.load();
+        if (result.ok) {
+            this._peers = this._normalize(result.items);
+            this._loaded = true;
+            console.log(`Loaded ${result.items.length} peers from ${this._peersFilePath}`);
+            return;
         }
+
+        this._peers = new Map();
+        this._loaded = false;
+        if (result.reason === 'corrupt') {
+            this._protectedReason = result.message;
+        }
+        console.error('Failed to load peers:', result.message);
+        this._warnOnce(result.message);
     }
 
-    private _createDefaultPeersFile(): void {
-        try {
-            const dir = path.dirname(this._peersFilePath);
-            if (!fs.existsSync(dir)) {
-                fs.mkdirSync(dir, { recursive: true });
+    /** 补全缺失的 id（旧文件没有 id 字段时按 ip:port 生成） */
+    private _normalize(items: StoredPeerInfo[]): Map<string, StoredPeerInfo> {
+        return new Map(items.map(p => {
+            if (!p.id) {
+                p.id = `${p.ip}:${p.port}`;
             }
-            
-            const defaultPeers: StoredPeerInfo[] = [];
-            fs.writeFileSync(this._peersFilePath, JSON.stringify(defaultPeers, null, 2));
-            console.log(`Created default peers.json at ${this._peersFilePath}`);
-        } catch (err) {
-            console.error('Failed to create default peers file:', err);
+            return [p.id, p];
+        }));
+    }
+
+    private _warnOnce(message: string): void {
+        if (this._warned.has(message)) {
+            return;
         }
+        this._warned.add(message);
+        void vscode.window.showWarningMessage(`OS Chat：${message}`);
+    }
+
+    /**
+     * 路径不可用期间积累的内存状态，在路径恢复后与文件内容合并，
+     * 避免用"只含新发现对端"的列表覆盖原文件里的手工配置。
+     */
+    private _lateLoad(): boolean {
+        const result = this._store.load();
+        if (!result.ok) {
+            if (result.reason === 'corrupt') {
+                this._protectedReason = result.message;
+                this._warnOnce(result.message);
+            }
+            return false;
+        }
+        this._peers = mergePeers(Array.from(this._normalize(result.items).values()), this._peers);
+        this._loaded = true;
+        return true;
     }
 
     private _savePeers(): void {
+        if (this._protectedReason) {
+            return;
+        }
+        if (!this._loaded && !this._lateLoad()) {
+            return;
+        }
         try {
-            const dir = path.dirname(this._peersFilePath);
-            if (!fs.existsSync(dir)) {
-                fs.mkdirSync(dir, { recursive: true });
-            }
-            const peersArray = Array.from(this._peers.values());
-            fs.writeFileSync(this._peersFilePath, JSON.stringify(peersArray, null, 2));
+            this._store.save(Array.from(this._peers.values()));
         } catch (err) {
             console.error('Failed to save peers:', err);
         }
